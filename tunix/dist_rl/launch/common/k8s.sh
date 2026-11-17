@@ -61,6 +61,7 @@ CONTAINER_CONFIG_ARGS=(
   "cluster_config.k8s.rollout_id=${K8S_ROLLOUT_ID}"
   "cluster_config.k8s.inference_id=${K8S_INFERENCE_ID}"
   "cluster_config.k8s.otel_id=${K8S_OTEL_ID}"
+  "cluster_config.k8s.tvcache_id=${K8S_TVCACHE_ID}"
 )
 for arg in "${CONFIG_ARGS[@]}"; do
   case "$arg" in
@@ -408,6 +409,64 @@ stop_otel() {
 # Deploys the OpenTelemetry collector: the Deployment and Service in
 # `jobset.otel.yaml`, configured by `otel-collector.yaml`. The nodes export to
 # it with OTEL_EXPORTER_OTLP_ENDPOINT=http://${K8S_OTEL_ID}:${OTEL_PORT}.
+# Deletes only this run's TVCache objects. The label is not used by the other
+# JobSets, so a stop cannot remove another run's cache.
+stop_tvcache() {
+  if ! is_true "${TVCACHE_ENABLE:-false}"; then
+    return 0
+  fi
+  if [[ -z "${RUN_ID}" ]]; then
+    echo "Error: TVCACHE_ENABLE=true but RUN_ID is empty." >&2
+    exit 1
+  fi
+  if is_true "${DRY_RUN}"; then
+    echo "kubectl delete deployment,service,networkpolicy -n ${K8S_NAMESPACE} -l tunix.dev/run-id=${RUN_ID}"
+  else
+    kubectl delete deployment,service,networkpolicy \
+      -n "${K8S_NAMESPACE}" \
+      -l "tunix.dev/run-id=${RUN_ID}" \
+      --ignore-not-found --wait=true
+  fi
+}
+
+# Applies the cache Deployment, Service, and NetworkPolicy, then waits until
+# the Deployment is ready. A timeout logs and returns: training starts
+# uncached, and rollout Pods connect when the cache comes up.
+start_tvcache() {
+  if ! is_true "${TVCACHE_ENABLE:-false}"; then
+    return 0
+  fi
+  if [[ -z "${K8S_TVCACHE_ID}" || -z "${RUN_ID}" ]]; then
+    echo "Error: TVCACHE_ENABLE=true requires K8S_TVCACHE_ID and RUN_ID." >&2
+    exit 1
+  fi
+  local names=""
+  if (( ROLLOUT_REPLICAS > 1 )); then
+    local i
+    for ((i = 0; i < ROLLOUT_REPLICAS; i++)); do
+      names+="- ${K8S_ROLLOUT_ID}-${i}"$'\n'
+    done
+  else
+    names+="- ${K8S_ROLLOUT_ID}"$'\n'
+  fi
+  export TVCACHE_ROLLOUT_JOBSET_NAMES="${names}"
+  run_yaml_gen \
+    "${YAML_DIR}/jobset.tvcache.yaml" \
+    --jobset_name="${K8S_TVCACHE_ID}" \
+    --namespace="${K8S_NAMESPACE}" \
+    --worker_container_image="${K8S_TUNIX_IMAGE}" \
+    | apply_manifest
+  local timeout="${TVCACHE_READY_TIMEOUT:-120}"
+  if is_true "${DRY_RUN}"; then
+    echo "kubectl rollout status deployment/${K8S_TVCACHE_ID} -n ${K8S_NAMESPACE} --timeout=${timeout}s"
+    return 0
+  fi
+  if ! kubectl rollout status "deployment/${K8S_TVCACHE_ID}" \
+      -n "${K8S_NAMESPACE}" --timeout="${timeout}s"; then
+    echo "TVCache not ready after ${timeout}s; training starts uncached, rollouts will connect when it is ready" >&2
+  fi
+}
+
 start_otel() {
   if is_true "${DRY_RUN}"; then
     echo "kubectl create configmap ${K8S_OTEL_ID}-config -n ${K8S_NAMESPACE} --from-file=otel-collector.yaml=${YAML_DIR}/otel-collector.yaml"
@@ -440,7 +499,7 @@ fi
 # `nodes/inference.py` and `cluster_config.k8s.inference_id` already support
 # k8s.
 case "${COMMAND}" in
-  stop|otel|stop-otel)
+  stop|otel|stop-otel|stop-tvcache)
     ;;
   *)
     if [[ -z "${K8S_TUNIX_IMAGE}" ]]; then
@@ -504,6 +563,8 @@ case "${COMMAND}" in
     stop_orchestrator
     stop_trainer
     stop_rollout
+    stop_tvcache
+    start_tvcache
     start_orchestrator
     start_trainer
     start_rollout
@@ -512,6 +573,7 @@ case "${COMMAND}" in
     stop_orchestrator
     stop_trainer
     stop_rollout
+    stop_tvcache
     ;;
   orchestrator)
     stop_orchestrator
@@ -532,8 +594,15 @@ case "${COMMAND}" in
   stop-otel)
     stop_otel
     ;;
+  tvcache)
+    stop_tvcache
+    start_tvcache
+    ;;
+  stop-tvcache)
+    stop_tvcache
+    ;;
   *)
-    echo "Error: Invalid command '${COMMAND}'. Available commands: 'start', 'stop', 'orchestrator', 'trainer', 'rollout', 'otel', 'stop-otel'." >&2
+    echo "Error: Invalid command '${COMMAND}'. Available commands: 'start', 'stop', 'orchestrator', 'trainer', 'rollout', 'otel', 'stop-otel', 'tvcache', 'stop-tvcache'." >&2
     exit 1
     ;;
 esac

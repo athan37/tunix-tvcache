@@ -106,17 +106,36 @@ and continues without the server. DeepSWE still uses the cache, because
 `DeepSWEEnv` forwards `tvcache` to `SWEEnv`.
 
 `local.sh` still starts the server for a distributed local run. The rollout
-node runs the single `SandboxManager` drain loop and sizes the TVCache thread
-pool to `max_concurrency`. Currently `cluster_config.target=local` with
-`rollout_replicas=1` only.
+node runs the `SandboxManager` drain loop only when `snapshot: true`, and it
+sizes the TVCache thread pool to `max_concurrency`. `snapshot: true` is
+`cluster_config.target=local` with `rollout_replicas=1` only.
 
-Advanced overrides live under `tvcache_config` (host, port, eviction, and
-`server_binary`). Leave `server_binary` empty to use the lookup above.
-`snapshot: false` is value-only. Set `snapshot: true` only for docker-commit
-forks. `SWEEnv` always binds its own `R2EGymSandbox`; `snapshot` and
-`task_id_key` (default `instance_id`) are the knobs that matter. Final grading
-goes through `executor.test` so a cache hit cannot score a sandbox that fell
-behind.
+`snapshot: false` also runs on Kubernetes with any `rollout_replicas`. Set
+`cluster_config.run_id` explicitly. `k8s.sh` starts one Deployment and
+ClusterIP Service named `<run_id>-tvcache` (DNS-1123) before the rollouts, and
+a NetworkPolicy that admits that run's rollout JobSets plus Pods labeled
+`tunix.dev/tvcache-bench=<run_id>`. Build the image with `INSTALL_TVCACHE=true`
+so `/opt/tvcache/bin/tvcache` is present. The readiness wait is
+`cluster_config.k8s.tvcache_ready_timeout_s` (default 120). If the cache is
+not ready, training starts uncached and rollouts connect when it is.
+
+A failed connect, lookup, or insert does not fail the episode when
+`snapshot: false`. A command that already finished returns its output. A
+command that has not started is replayed onto the sandbox and run once. The
+episode then stays uncached, including grading. If recovery itself fails, or
+the command was in progress when the cache died, the episode ends as `ERROR`.
+`snapshot: true` still raises on those errors. Step logs include
+`tvcache hit=..% grade_hit=..% fallback=.. bypassed=..`.
+
+Advanced overrides live under `tvcache_config` (host, port, eviction,
+timeouts, and `server_binary`). Leave `server_binary` empty to use the lookup
+above. On Kubernetes the host is the Service name and the binary lookup is
+skipped. `snapshot: false` is value-only. Set `snapshot: true` only for
+docker-commit forks. `SWEEnv` always binds its own `R2EGymSandbox`; `snapshot`
+and `task_id_key` (default `instance_id`) are the knobs that matter. The cache
+key also includes the run namespace, the sandbox image, and the grading
+settings. Final grading goes through `executor.test` so a cache hit cannot
+score a sandbox that fell behind.
 
 The tool-value cache is **not** cleared on weight sync: it keys environment
 state, not model weights.

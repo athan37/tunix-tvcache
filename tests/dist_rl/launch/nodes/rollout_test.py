@@ -607,25 +607,22 @@ class CreateRolloutWorkerTest(absltest.TestCase):
     )
 
   def test_worker_env_config_includes_tvcache_when_enabled(self):
+    hp = _hp(
+        "rollout_engine=vllm",
+        "tvcache_config.enable=true",
+        "tvcache_config.server_binary=/tmp/tvcache",
+        "tvcache_config.host=127.0.0.1",
+        "tvcache_config.port=7878",
+        "tvcache_config.task_id_key=instance_id",
+        "cluster_config.target=local",
+        "agentic_grpo_config.beta=0.0",
+        *_TOOL_CACHE_ENV,
+    )
     with mock.patch.object(vllm_sampler, "VllmSampler", autospec=True):
       with mock.patch(
           "tunix.rl.agentic.tools.tvcache.ensure_local_server"
       ) as ensure:
-        rollout._create_rollout_worker(
-            _hp(
-                "rollout_engine=vllm",
-                "tvcache_config.enable=true",
-                "tvcache_config.server_binary=/tmp/tvcache",
-                "tvcache_config.host=127.0.0.1",
-                "tvcache_config.port=7878",
-                "tvcache_config.task_id_key=instance_id",
-                "cluster_config.target=local",
-                "agentic_grpo_config.beta=0.0",
-                *_TOOL_CACHE_ENV,
-            ),
-            "rollout-0",
-            self.tokenizer,
-        )
+        rollout._create_rollout_worker(hp, "rollout-0", self.tokenizer)
     ensure.assert_called_once_with(port=7878)
     self.assertEqual(
         self._worker_kwargs()["env_config"]["tvcache"],
@@ -637,8 +634,43 @@ class CreateRolloutWorkerTest(absltest.TestCase):
             ),
             "task_id_key": "instance_id",
             "snapshot": False,
+            "namespace": hp.config_mapping("cluster_config")["run_id"],
+            "rpc_timeout_s": 5.0,
+            "connect_timeout_s": 2.0,
+            "connect_retry_after_s": 60,
         },
     )
+
+  def test_remote_host_skips_local_server_and_passes_namespace(self):
+    hp = _hp(
+        "rollout_engine=vllm",
+        "tvcache_config.enable=true",
+        "tvcache_config.server_binary=/tmp/tvcache",
+        "tvcache_config.host=run-1-tvcache",
+        "tvcache_config.namespace=run-1",
+        "tvcache_config.snapshot=false",
+        "cluster_config.target=local",
+        "agentic_grpo_config.beta=0.0",
+        *_TOOL_CACHE_ENV,
+    )
+    with mock.patch.object(vllm_sampler, "VllmSampler", autospec=True):
+      with mock.patch(
+          "tunix.rl.agentic.tools.tvcache.ensure_local_server"
+      ) as ensure:
+        rollout._create_rollout_worker(hp, "rollout-0", self.tokenizer)
+    ensure.assert_not_called()
+    self.assertFalse(rollout._tvcache_runs_drain_loop(  # pylint: disable=protected-access
+        hp.config_mapping("tvcache_config")
+    ))
+    self.assertEqual(
+        self._worker_kwargs()["env_config"]["tvcache"]["namespace"], "run-1"
+    )
+
+  def test_snapshot_true_runs_drain_loop(self):
+    tvcache = {"enable": True, "snapshot": True, "host": "127.0.0.1"}
+    self.assertTrue(rollout._tvcache_runs_drain_loop(tvcache))  # pylint: disable=protected-access
+    tvcache["snapshot"] = False
+    self.assertFalse(rollout._tvcache_runs_drain_loop(tvcache))  # pylint: disable=protected-access
 
   def test_worker_skips_tvcache_when_env_has_no_tool_calls(self):
     with mock.patch.object(vllm_sampler, "VllmSampler", autospec=True):

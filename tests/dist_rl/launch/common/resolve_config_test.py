@@ -1918,15 +1918,49 @@ weight_sync_config:
     self.assertIn("export TVCACHE_ENABLE=false\n", exports)
     self.assertIn("export TVCACHE_PORT=7878\n", exports)
 
-  def test_tvcache_rejects_k8s(self):
-    with self.assertRaisesRegex(ValueError, "only supported for"):
+  def test_tvcache_k8s_requires_explicit_run_id(self):
+    with self.assertRaisesRegex(ValueError, "explicit"):
       resolve_config.initialize([
           "tvcache_config.enable=true",
-          "tvcache_config.server_binary=/tmp/tvcache",
+          "tvcache_config.snapshot=false",
           "cluster_config.target=k8s",
           "agentic_grpo_config.beta=0.0",
           *_TOOL_CACHE_ENV,
       ])
+
+  def test_tvcache_k8s_snapshot_true_rejected(self):
+    with self.assertRaisesRegex(ValueError, "snapshot=true"):
+      resolve_config.initialize([
+          "tvcache_config.enable=true",
+          "tvcache_config.snapshot=true",
+          "cluster_config.target=k8s",
+          "cluster_config.run_id=run-1",
+          "agentic_grpo_config.beta=0.0",
+          *_TOOL_CACHE_ENV,
+      ])
+
+  def test_tvcache_k8s_value_only_allows_replicas_and_skips_binary(self):
+    with mock.patch(
+        "tunix.rl.agentic.tools.tvcache.resolve_server_binary",
+        side_effect=AssertionError("k8s must not look up a server binary"),
+    ):
+      hp = resolve_config.initialize([
+          "tvcache_config.enable=true",
+          "tvcache_config.snapshot=false",
+          "cluster_config.target=k8s",
+          "cluster_config.run_id=run_2026_01_01",
+          "cluster_config.rollout_replicas=4",
+          "agentic_grpo_config.beta=0.0",
+          *_TOOL_CACHE_ENV,
+      ])
+    tvcache = hp.config_mapping("tvcache_config")
+    k8s = hp.config_mapping("cluster_config")["k8s"]
+    self.assertEqual(k8s["tvcache_id"], "run-2026-01-01-tvcache")
+    self.assertEqual(tvcache["host"], "run-2026-01-01-tvcache")
+    self.assertRegex(k8s["tvcache_id"], r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+    exports = resolve_config.render_bash_exports(hp)
+    self.assertIn("export K8S_TVCACHE_ID=run-2026-01-01-tvcache\n", exports)
+    self.assertIn("export TVCACHE_READY_TIMEOUT=120\n", exports)
 
   def test_tvcache_rejects_empty_binary(self):
     with mock.patch.dict(os.environ, {"TVCACHE_BINARY": ""}):

@@ -71,7 +71,16 @@ class SWEEnvTvcacheTest(absltest.TestCase):
       self.assertEqual(obs, "fix the bug")
       self.assertIsNone(env.env)
       bridge_cls.assert_called_once()
-      self.assertEqual(bridge_cls.call_args.args[1], "same")
+      self.assertEqual(
+          bridge_cls.call_args.args[1],
+          tvcache_lib.cache_task_id(
+              config.namespace,
+              env.entry,
+              env._tvcache_identity_extra(),  # pylint: disable=protected-access
+              task_id_key="instance_id",
+          ),
+      )
+      self.assertIn("/", bridge_cls.call_args.args[1])
       self.assertIn("sandbox_cls", bridge_cls.call_args.kwargs)
       # final_reward_fn routes through bridge.test
       self.assertEqual(env.final_reward_fn(), 1.0)
@@ -121,6 +130,63 @@ class SWEEnvTvcacheTest(absltest.TestCase):
           make_call.assert_called_once_with(action)
           fake_bridge.call.assert_called_once_with(fake_tool_call)
           env.close()
+
+  def test_insert_failure_during_replay_runs_the_command_once(self):
+    try:
+      import tvclient  # pylint: disable=g-import-not-at-top,unused-import
+    except ImportError:
+      self.skipTest("tvclient is not installed")
+    from tests.rl.agentic.tools import tvcache_recovery_test as recovery
+
+    recovery.CountingSandbox.reset()
+    tvcache_lib.reset_connect_backoff_for_test()
+    edit = tvcache_lib.make_cached_tool_call("edit", {}, mutates=True)
+    read = tvcache_lib.make_cached_tool_call("read", {}, mutates=False)
+    client = recovery.ScriptedClient()
+    client.find_results = [
+        json.dumps({"obs": "edited", "reward": 0, "done": False, "info": {}}),
+        None,
+    ]
+    client.fail_insert_paths.add((edit.serialize(),))
+    calls = [edit, read]
+    action = mock.Mock(function_name="file_editor")
+    config = tvcache_lib.TvcacheConfig(
+        host="127.0.0.1", port=9, snapshot=False, connect_timeout_s=0.2
+    )
+    with mock.patch.object(swe_env, "Action", mock.Mock()):
+      with mock.patch(
+          "examples.deepswe.r2egym_tvcache.bind_sandbox_cls",
+          return_value=recovery.CountingSandbox,
+      ):
+        with mock.patch(
+            "examples.deepswe.r2egym_tvcache.make_r2egym_tool_call",
+            side_effect=lambda _action: calls.pop(0),
+        ):
+          env = swe_env.SWEEnv(
+              entry={
+                  "instance_id": "t",
+                  "problem_statement": "p",
+                  "docker_image": "img",
+              },
+              backend="docker",
+              max_steps=4,
+              tvcache=config,
+          )
+          env._initial_observation()  # pylint: disable=protected-access
+          bridge = env._tvcache_bridge  # pylint: disable=protected-access
+          bridge._adapter.bind_client(client)  # pylint: disable=protected-access
+          first = env._step_impl(action)  # pylint: disable=protected-access
+          second = env._step_impl(action)  # pylint: disable=protected-access
+          self.assertEqual(first.observation, "edited")
+          self.assertEqual(second.observation, "read")
+          sandbox = bridge._bypass_sandbox  # pylint: disable=protected-access
+          self.assertEqual(recovery._names(sandbox), ["edit", "read"])
+          finds = len(client.finds)
+          env.final_reward_fn()
+          self.assertEqual(len(client.finds), finds)
+          self.assertEqual(client.inserts, [[edit.serialize()]])
+          env.close()
+          self.assertEqual(sandbox.stops, 1)
 
 
 if __name__ == "__main__":

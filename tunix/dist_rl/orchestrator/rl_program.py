@@ -1211,6 +1211,9 @@ class StandardRLProgram(RLProgram):
     )
     if slowest is not None:
       logging.info("[rollout] step=%d %s", log_step, slowest)
+    cache_summary = step_telemetry.tool_cache_summary(rollout_facts)
+    if cache_summary is not None:
+      logging.info("[rollout] step=%d %s", log_step, cache_summary)
 
     # Generation/rollout metrics grouped under rollout/*.
     if generation_metrics:

@@ -503,6 +503,54 @@ class SlowestRolloutsSummaryTest(absltest.TestCase):
         " worker=w1 | traj_p0_g2 dur=50.0s status=SUCCEEDED worker=w2",
     )
 
+  def test_tool_cache_summary(self):
+    facts = [
+        step_telemetry.RolloutFacts(
+            traj_id="a",
+            status="SUCCEEDED",
+            num_turns=None,
+            turn_lengths=None,
+            window=None,
+            tool_cache={
+                "hits": 3,
+                "misses": 1,
+                "grading_hit": 1,
+                "fallback_not_started": 1,
+                "bypassed": 1,
+            },
+        ),
+        step_telemetry.RolloutFacts(
+            traj_id="b",
+            status="SUCCEEDED",
+            num_turns=None,
+            turn_lengths=None,
+            window=None,
+            tool_cache={"hits": 1, "misses": 1, "grading_hit": 0},
+        ),
+    ]
+    health = step_telemetry.rollout_health(facts)
+    self.assertAlmostEqual(health.metrics["rollout/tvcache/hit_frac"], 4 / 6)
+    self.assertAlmostEqual(
+        health.metrics["rollout/tvcache/grading_hit_frac"], 0.5
+    )
+    self.assertEqual(health.metrics["rollout/tvcache/fallback"], 1)
+    self.assertEqual(health.metrics["rollout/tvcache/bypassed"], 1)
+    summary = step_telemetry.tool_cache_summary(facts)
+    self.assertEqual(
+        summary, "tvcache hit=67% grade_hit=50% fallback=1 bypassed=1"
+    )
+    self.assertIsNone(
+        step_telemetry.tool_cache_summary([
+            step_telemetry.RolloutFacts(
+                traj_id="c",
+                status="SUCCEEDED",
+                num_turns=None,
+                turn_lengths=None,
+                window=None,
+            )
+        ])
+    )
+
   def test_returns_none_without_lineage(self):
     self.assertIsNone(
         step_telemetry.slowest_rollouts_summary(_facts(_health_item(0)), k=3)

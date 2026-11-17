@@ -254,9 +254,12 @@ kubernetes_config: {}
 ############################### TVCache ###############################
 # One switch. When true, Tunix uses a tvcache binary already on the machine,
 # or one placed beside this package, and starts it if nothing is listening
-# on port 7878. Supported only for `cluster_config.target: local` with
-# `rollout_replicas: 1`. An environment that does not use tools (for example
-# GSM8K) logs a warning and continues with the cache off.
+# on port 7878. `snapshot: false` (the default) also runs on Kubernetes with
+# any `rollout_replicas`: one Deployment per run serves every rollout Pod.
+# `snapshot: true` stays `target: local` with `rollout_replicas: 1`. An
+# environment that does not use tools (for example GSM8K) logs a warning and
+# continues with the cache off. On Kubernetes, set `cluster_config.run_id`
+# explicitly so a later stop can find this run's cache.
 enable_tool_cache: false
 
 # Advanced overrides. Prefer enable_tool_cache above. `local.sh` starts the
@@ -275,6 +278,13 @@ tvcache_config:
   # false = value-only (hits skip execution; no docker commit forks).
   # true = adaptive snapshots (requires a fork-capable sandbox, e.g. R2EGymSandbox on Docker).
   snapshot: false
+  # Empty uses the launcher run id. A notebook without one gets a per-process id.
+  namespace: ""
+  # Cache RPC timeout, connect timeout, and how long a rollout process waits
+  # before trying a dead cache again. Training starts uncached either way.
+  rpc_timeout_s: 5.0
+  connect_timeout_s: 2.0
+  connect_retry_after_s: 60
 
 agentic_ppo_config: {}
 agentic_grpo_config:
@@ -505,6 +515,12 @@ cluster_config:
     # OTEL_EXPORTER_OTLP_ENDPOINT=http://<otel_id>:<ports.otel> when launching;
     # every node then exports to it (`tunix/dist_rl/common/otel_setup.py`).
     otel_id: ""
+    # Name of this run's TVCache Deployment and Service. Empty becomes a
+    # DNS-1123 form of `<run_id>-tvcache`. Rollout Pods use it as the cache host.
+    tvcache_id: ""
+    # Seconds `k8s.sh` waits for the cache Deployment. On timeout it logs and
+    # starts training uncached; rollouts connect when the cache is ready.
+    tvcache_ready_timeout_s: 120
     cpu_machine: "n2-standard-64"
     # Orchestrator node pool and memory request. Empty `cpu_nodepool` selects
     # the node by `cpu_machine`; empty `cpu_memory` requests none.

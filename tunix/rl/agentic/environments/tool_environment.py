@@ -138,12 +138,20 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
 
     from tunix.rl.agentic.tools import tvcache as tvcache_lib  # pylint: disable=g-import-not-at-top
 
-    task_id = tvcache_lib.task_id_for(
-        self.task or {}, self._tvcache_config.task_id_key
+    task_id = tvcache_lib.cache_task_id(
+        self._tvcache_config.namespace,
+        self.task or {},
+        task_id_key=self._tvcache_config.task_id_key,
     )
     self._tvcache_bridge = tvcache_lib.TvcacheBridge(
         self._tvcache_config, task_id
     )
+
+  def tool_cache_stats(self) -> dict[str, int] | None:
+    """Cache counters for this episode, or None when the cache is off."""
+    if self._tvcache_bridge is None:
+      return None
+    return self._tvcache_bridge.stats()
 
   def _step_impl(self, action: Any) -> base_environment.EnvStepResult:
     """Execute one logical step of tool interaction based on agent's action.

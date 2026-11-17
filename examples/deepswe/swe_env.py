@@ -270,16 +270,49 @@ class SWEEnv(BaseTaskEnv):
     # Bound class closes over this episode so concurrent GRPO samples that
     # share instance_id do not race. The dotted sandbox_class is unused here.
     config = self._tvcache_config
-    task_id_key = config.task_id_key or "instance_id"
-    if task_id_key == "instance_id":
-      task_id = str(self.entry["instance_id"])
-    else:
-      task_id = tvcache_lib.task_id_for(self.entry, task_id_key)
+    task_id = tvcache_lib.cache_task_id(
+        config.namespace,
+        self.entry,
+        self._tvcache_identity_extra(),
+        task_id_key=config.task_id_key or "instance_id",
+    )
     self._tvcache_bridge = tvcache_lib.TvcacheBridge(
         config,
         task_id,
         sandbox_cls=r2egym_tvcache.bind_sandbox_cls(self),
     )
+
+  def _resolved_sandbox_image(self) -> str:
+    """Returns the image the sandbox would start, after rewrite."""
+    task_img = self.entry.get("docker_image", "")
+    if isinstance(task_img, (list, np.ndarray)):
+      task_img = task_img[0] if len(task_img) > 0 else ""
+    task_img_str = str(task_img)
+    fleet = self.fleet or getattr(sandbox_utils, "_GLOBAL_FLEET", None)
+    rewrite_fn = _get_image_rewrite_fn(
+        getattr(fleet, "_image_rewrite_fn", None) if fleet is not None else None
+    )
+    if rewrite_fn and task_img_str:
+      task_img_str = rewrite_fn(task_img_str)
+    return task_img_str
+
+  def _tvcache_identity_extra(self) -> dict[str, Any]:
+    """Image and grading settings that must not share a cache entry."""
+    return {
+        "image": self._resolved_sandbox_image(),
+        "grading": {
+            "scaffold": self.scaffold,
+            "step_timeout": self.step_timeout,
+            "reward_timeout": self.reward_timeout,
+            "backend": self.backend,
+        },
+    }
+
+  def tool_cache_stats(self) -> dict[str, int] | None:
+    """Cache counters for this episode, or None when the cache is off."""
+    if self._tvcache_bridge is None:
+      return None
+    return self._tvcache_bridge.stats()
 
   def _final_reward_via_tvcache(self) -> float:
     assert self._tvcache_bridge is not None

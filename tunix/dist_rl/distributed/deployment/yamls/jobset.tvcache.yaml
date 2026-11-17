@@ -1,0 +1,111 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# One TVCache server for a training run. Rollout Pods reach it at
+# ${JOBSET_NAME}:7878. `strategy: Recreate` keeps a single process, which the
+# server assumes: the cache lock and the sandbox drain loop are in-process.
+# The NetworkPolicy admits this run's rollout JobSets and benchmark Pods
+# labeled tunix.dev/tvcache-bench=${RUN_ID}.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${JOBSET_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${JOBSET_NAME}
+    tunix.dev/run-id: ${RUN_ID}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ${JOBSET_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${JOBSET_NAME}
+        tunix.dev/run-id: ${RUN_ID}
+    spec:
+      containers:
+      - name: tvcache
+        image: ${USER_CONTAINER_IMAGE}
+        command: ["/opt/tvcache/bin/tvcache"]
+        args:
+        - --eviction-policy=ttl_and_watermark
+        - --high-watermark-mb=1024
+        - --low-watermark-mb=768
+        ports:
+        - containerPort: 7878
+          name: tvcache
+          protocol: TCP
+        readinessProbe:
+          tcpSocket:
+            port: 7878
+          initialDelaySeconds: 1
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: "1"
+            memory: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${JOBSET_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${JOBSET_NAME}
+    tunix.dev/run-id: ${RUN_ID}
+spec:
+  type: ClusterIP
+  selector:
+    app: ${JOBSET_NAME}
+  ports:
+  - name: tvcache
+    port: 7878
+    targetPort: 7878
+    protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ${JOBSET_NAME}-ingress
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${JOBSET_NAME}
+    tunix.dev/run-id: ${RUN_ID}
+spec:
+  podSelector:
+    matchLabels:
+      app: ${JOBSET_NAME}
+  policyTypes:
+  - Ingress
+  ingress:
+  - ports:
+    - protocol: TCP
+      port: 7878
+    from:
+    - podSelector:
+        matchExpressions:
+        - key: jobset.sigs.k8s.io/jobset-name
+          operator: In
+          values:
+            ${ROLLOUT_JOBSET_NAMES}
+    - podSelector:
+        matchLabels:
+          tunix.dev/tvcache-bench: ${RUN_ID}

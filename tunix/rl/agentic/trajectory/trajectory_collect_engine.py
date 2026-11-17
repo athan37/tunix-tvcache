@@ -26,6 +26,7 @@ import inspect
 import itertools
 import json
 import time
+from collections.abc import Mapping
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from absl import logging
@@ -44,6 +45,17 @@ from tunix.rl.rollout import base_rollout
 
 BaseTaskEnv = base_environment.BaseTaskEnv
 ConversationAgentBase = base_agent.ConversationAgentBase
+
+
+def _tool_cache_for_traj(env: Any) -> dict[str, int] | None:
+  """Reads ``env.tool_cache_stats()`` when the environment defines it."""
+  reader = getattr(env, "tool_cache_stats", None)
+  if not callable(reader):
+    return None
+  stats = reader()
+  if not isinstance(stats, Mapping):
+    return None
+  return {str(key): int(value) for key, value in stats.items()}
 
 
 def encode_turn_routed_experts(
@@ -761,6 +773,7 @@ class TrajectoryCollectEngine:
           f" {['Trajectory', 'Steps', 'Token', 'Conversation']}",
       )
 
+    tool_cache = _tool_cache_for_traj(self.env)
     if mode == "Trajectory":
       self.agent.trajectory.env_time = self.env_time  # pyrefly: ignore[bad-assignment]
       self.agent.trajectory.reward_time = self.reward_time
@@ -783,6 +796,11 @@ class TrajectoryCollectEngine:
               "mc_return": step.mc_return,
               "env_time": self.env_time,
               "reward_time": self.reward_time,
+              **(
+                  {"tool_cache": tool_cache}
+                  if tool_cache is not None
+                  else {}
+              ),
           }
           for step in self.agent.trajectory.steps
       ]
@@ -932,6 +950,9 @@ class TrajectoryCollectEngine:
           "trajectory_reward": self.agent.trajectory.reward,
           "env_time": self.env_time,
           "reward_time": self.reward_time,
+          **(
+              {"tool_cache": tool_cache} if tool_cache is not None else {}
+          ),
           "old_logprobs": (
               np.concatenate(logprobs, axis=0) if logprobs else None
           ),

@@ -274,6 +274,10 @@ def _finalize_dist_defaults(hp: cli_config.HyperParameters) -> None:
 
   _resolve_sandbox_namespace(hp, target)
 
+  # A later `stop` finds this run's cache by run id. An id filled in here is
+  # not one the operator can pass to that stop, so k8s rejects it when the
+  # cache is on.
+  hp.explicit_run_id = bool(str(cluster["run_id"]).strip())  # type: ignore[attr-defined]
   if not cluster["run_id"]:
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
     cluster["run_id"] = f"run_{ts}_{os.getpid()}"
@@ -642,20 +646,47 @@ def _tool_cache_env_class(hp: cli_config.HyperParameters) -> type | None:
     return None
 
 
+_DNS1123_MAX = 54
+_DNS1123_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+
+
+def _dns1123_name(value: str, *, max_len: int = _DNS1123_MAX) -> str:
+  """Returns a DNS-1123 label, at most ``max_len`` characters.
+
+  The cap leaves room for the ``-ingress`` suffix on the NetworkPolicy name.
+  """
+  cleaned = re.sub(r"[^a-z0-9-]+", "-", value.lower()).strip("-")
+  if not cleaned or not cleaned[0].isalnum():
+    cleaned = f"a{cleaned}".strip("-")
+  cleaned = cleaned[:max_len].strip("-")
+  if not cleaned or _DNS1123_RE.fullmatch(cleaned) is None:
+    raise ValueError(
+        f"{value!r} is not a DNS-1123 name (lowercase letters, digits, and"
+        " hyphens)."
+    )
+  return cleaned
+
+
 def _validate_tvcache_config(hp: cli_config.HyperParameters) -> None:
   """Checks `tvcache_config` when the tool-value cache is enabled.
 
   `enable_tool_cache: true` turns `tvcache_config.enable` on. An empty
-  `server_binary` is filled by finding the server or building it on first use.
-  An environment that does not accept `tvcache` logs a warning and turns the
-  cache off, so the server is not built or started.
+  `server_binary` is filled by finding the server or building it on first use,
+  except on Kubernetes, where the cache Deployment runs the binary from the
+  image. An environment that does not accept `tvcache` logs a warning and
+  turns the cache off.
+
+  `snapshot: false` may run on Kubernetes with any rollout replica count. One
+  Deployment per run serves every rollout Pod. `snapshot: true` stays local
+  with one replica, because each process would otherwise run its own drain
+  loop and `R2EGymSandbox.fork` needs Docker.
 
   Args:
     hp: Loaded configuration.
 
   Raises:
-    ValueError: If TVCache is enabled on a non-local target, without a
-      server binary, or with more than one rollout replica.
+    ValueError: If snapshot mode is not local with one replica, if Kubernetes
+      is missing an explicit run id, or if a cache setting is invalid.
   """
   if bool(hp.config.get("enable_tool_cache", False)):
     hp.config["tvcache_config"]["enable"] = True
@@ -675,25 +706,59 @@ def _validate_tvcache_config(hp: cli_config.HyperParameters) -> None:
     )
     tvcache["enable"] = False
     return
-  cluster = hp.config_mapping("cluster_config")
-  if cluster["target"] != "local":
+  cluster = hp.config["cluster_config"]
+  snapshot = tvcache["snapshot"]
+  if not isinstance(snapshot, bool):
     raise ValueError(
-        "tvcache_config.enable=true is only supported for"
-        " cluster_config.target=local; k8s support is a follow-up."
+        f"tvcache_config.snapshot must be a bool, got {snapshot!r}."
     )
-  server_binary = tvcache["server_binary"]
-  if not isinstance(server_binary, str) or not server_binary.strip():
-    try:
-      tvcache["server_binary"] = tvcache_lib.resolve_server_binary()
-    except FileNotFoundError as exc:
-      raise ValueError(str(exc)) from exc
+  target = str(cluster["target"])
   replicas = cluster["rollout_replicas"]
-  if replicas != 1:
+  if snapshot:
+    if target != "local" or replicas != 1:
+      raise ValueError(
+          "tvcache_config.snapshot=true is only supported for"
+          " cluster_config.target=local with rollout_replicas=1"
+          f" (got target={target!r}, rollout_replicas={replicas})."
+      )
+  elif target not in ("local", "k8s"):
     raise ValueError(
-        "tvcache_config.enable=true requires cluster_config.rollout_replicas=1"
-        f" (got {replicas}); one SandboxManager drain loop runs in the"
-        " rollout process."
+        "tvcache_config.enable=true supports cluster_config.target local or"
+        f" k8s, got {target!r}."
     )
+  if target == "k8s":
+    if not getattr(hp, "explicit_run_id", False):
+      raise ValueError(
+          "tvcache on cluster_config.target=k8s requires an explicit"
+          " cluster_config.run_id. A generated id cannot be passed to a later"
+          " stop, so that stop would not find this run's cache."
+      )
+    k8s = cluster["k8s"]
+    raw_id = str(k8s["tvcache_id"] or "")
+    if raw_id.strip():
+      tvcache_id = _dns1123_name(raw_id)
+      if tvcache_id != raw_id:
+        raise ValueError(
+            "cluster_config.k8s.tvcache_id must be a DNS-1123 name of at most"
+            f" {_DNS1123_MAX} characters, got {raw_id!r}."
+        )
+    else:
+      tvcache_id = _dns1123_name(f"{cluster['run_id']}-tvcache")
+      k8s["tvcache_id"] = tvcache_id
+    tvcache["host"] = tvcache_id
+  else:
+    server_binary = tvcache["server_binary"]
+    if not isinstance(server_binary, str) or not server_binary.strip():
+      try:
+        tvcache["server_binary"] = tvcache_lib.resolve_server_binary()
+      except FileNotFoundError as exc:
+        raise ValueError(str(exc)) from exc
+    if replicas != 1 and target == "local" and snapshot:
+      raise ValueError(
+          "tvcache_config.snapshot=true requires"
+          " cluster_config.rollout_replicas=1"
+          f" (got {replicas})."
+      )
   port = tvcache["port"]
   if isinstance(port, bool) or not isinstance(port, int) or port <= 0:
     raise ValueError(
@@ -705,11 +770,28 @@ def _validate_tvcache_config(hp: cli_config.HyperParameters) -> None:
         "tvcache_config.eviction_policy must be 'ttl_and_watermark' or 'none',"
         f" got {policy!r}."
     )
-  snapshot = tvcache["snapshot"]
-  if not isinstance(snapshot, bool):
-    raise ValueError(
-        f"tvcache_config.snapshot must be a bool, got {snapshot!r}."
-    )
+  for key in ("rpc_timeout_s", "connect_timeout_s", "connect_retry_after_s"):
+    timeout = tvcache[key]
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+      raise ValueError(
+          f"tvcache_config.{key} must be a positive number, got {timeout!r}."
+      )
+    if float(timeout) <= 0:
+      raise ValueError(
+          f"tvcache_config.{key} must be a positive number, got {timeout!r}."
+      )
+  if target == "k8s":
+    ready = cluster["k8s"]["tvcache_ready_timeout_s"]
+    if isinstance(ready, bool) or not isinstance(ready, (int, float)):
+      raise ValueError(
+          "cluster_config.k8s.tvcache_ready_timeout_s must be a positive"
+          f" number, got {ready!r}."
+      )
+    if float(ready) <= 0:
+      raise ValueError(
+          "cluster_config.k8s.tvcache_ready_timeout_s must be a positive"
+          f" number, got {ready!r}."
+      )
 
 
 def _validate_trajectory_logging(hp: cli_config.HyperParameters) -> None:
@@ -1790,6 +1872,8 @@ def render_bash_exports(hp: DistHyperParameters) -> str:
       "K8S_ROLLOUT_ID": k8s["rollout_id"],
       "K8S_INFERENCE_ID": k8s["inference_id"],
       "K8S_OTEL_ID": k8s["otel_id"],
+      "K8S_TVCACHE_ID": k8s["tvcache_id"],
+      "TVCACHE_READY_TIMEOUT": k8s["tvcache_ready_timeout_s"],
       "K8S_CPU_MACHINE": k8s["cpu_machine"],
       "K8S_CPU_NODEPOOL": k8s["cpu_nodepool"],
       "K8S_CPU_MEMORY": k8s["cpu_memory"],
@@ -1843,6 +1927,9 @@ def render_bash_exports(hp: DistHyperParameters) -> str:
       "TVCACHE_EVICTION_POLICY": tvcache["eviction_policy"],
       "TVCACHE_HIGH_WATERMARK_MB": tvcache["high_watermark_mb"],
       "TVCACHE_LOW_WATERMARK_MB": tvcache["low_watermark_mb"],
+      "TVCACHE_RPC_TIMEOUT_S": tvcache["rpc_timeout_s"],
+      "TVCACHE_CONNECT_TIMEOUT_S": tvcache["connect_timeout_s"],
+      "TVCACHE_CONNECT_RETRY_AFTER_S": tvcache["connect_retry_after_s"],
   }
 
   lines = [f"export {k}={_bash_quote(v)}" for k, v in exports.items()]

@@ -919,6 +919,11 @@ def build_substitutions(
       "STARTUP_COMMAND": args.worker_startup_command,
       "RAY_HEAD_PRE_INIT_COMMAND": args.ray_head_pre_init_command,
       "RAY_WORKER_PRE_INIT_COMMAND": args.ray_worker_pre_init_command,
+      # Used by jobset.tvcache.yaml. Empty outside a TVCache launch.
+      "RUN_ID": os.environ.get("RUN_ID", ""),
+      "ROLLOUT_JOBSET_NAMES": os.environ.get(
+          "TVCACHE_ROLLOUT_JOBSET_NAMES", ""
+      ),
   }
 
 

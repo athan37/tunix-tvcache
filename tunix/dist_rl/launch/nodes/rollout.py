@@ -771,6 +771,24 @@ _SAMPLER_BUILDERS: Mapping[str, SamplerBuilder] = {
 }
 
 
+def _tvcache_starts_local_server(tvcache: Mapping[str, Any]) -> bool:
+  """True when this process should start the tvcache binary on localhost."""
+  if not tvcache["enable"]:
+    return False
+  from tunix.rl.agentic.tools import tvcache as tvcache_lib  # pylint: disable=g-import-not-at-top
+
+  return tvcache_lib.is_local_host(str(tvcache["host"]))
+
+
+def _tvcache_runs_drain_loop(tvcache: Mapping[str, Any]) -> bool:
+  """True when snapshot mode needs this process's SandboxManager drain loop.
+
+  Value-only mode (``snapshot: false``) never forks, so there is nothing to
+  drain and every rollout replica can share one server.
+  """
+  return bool(tvcache["enable"]) and bool(tvcache["snapshot"])
+
+
 def _create_rollout_worker(
     hp: resolve_config.DistHyperParameters, worker_id: str, tokenizer: Tokenizer
 ) -> rollout_worker.RolloutWorker:
@@ -791,14 +809,23 @@ def _create_rollout_worker(
     # Env adapters (ToolEnvironment / SWEEnv) accept this as TvcacheConfig.
     from tunix.rl.agentic.tools import tvcache as tvcache_lib  # pylint: disable=g-import-not-at-top
 
-    tvcache_lib.ensure_local_server(port=int(tvcache["port"]))
+    if _tvcache_starts_local_server(tvcache):
+      tvcache_lib.ensure_local_server(port=int(tvcache["port"]))
     tvcache_lib.configure_thread_pool(max_concurrency)
+    cluster = hp.config_mapping("cluster_config")
+    namespace = str(tvcache["namespace"] or "")
+    if not namespace:
+      namespace = str(cluster["run_id"])
     env_config["tvcache"] = {
         "host": tvcache["host"],
         "port": int(tvcache["port"]),
         "sandbox_class": tvcache["sandbox_class"],
         "task_id_key": tvcache["task_id_key"],
         "snapshot": bool(tvcache["snapshot"]),
+        "namespace": namespace,
+        "rpc_timeout_s": float(tvcache["rpc_timeout_s"]),
+        "connect_timeout_s": float(tvcache["connect_timeout_s"]),
+        "connect_retry_after_s": float(tvcache["connect_retry_after_s"]),
     }
   logging.info("Creating RolloutWorker wrapper...")
   return rollout_worker.RolloutWorker(
@@ -888,7 +915,7 @@ def main(
     drain_task = None
     drain_stop = None
     tvcache = hp.config_mapping("tvcache_config")
-    if tvcache["enable"]:
+    if _tvcache_runs_drain_loop(tvcache):
       from tunix.rl.agentic.tools import tvcache as tvcache_lib  # pylint: disable=g-import-not-at-top
 
       tvclient = tvcache_lib._require_tvclient()  # pylint: disable=protected-access

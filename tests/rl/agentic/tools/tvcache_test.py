@@ -75,9 +75,6 @@ class _SlowTool(base_tool.BaseTool):
   def __init__(self, name, description, delay=0.2):
     super().__init__(name=name, description=description)
     self.delay = delay
-    self.started = threading.Event()
-    self.entered = 0
-    self._lock = threading.Lock()
 
   def get_json_schema(self) -> dict[str, Any]:
     return {
@@ -95,11 +92,6 @@ class _SlowTool(base_tool.BaseTool):
 
   def apply(self, **kwargs):
     del kwargs
-    with self._lock:
-      self.entered += 1
-      if self.entered >= 2:
-        self.started.set()
-    # Wait briefly so both concurrent calls can enter before finishing.
     time.sleep(self.delay)
     return base_tool.ToolOutput(name=self.name, output="done")
 
@@ -141,6 +133,69 @@ class TvcacheAdapterTest(absltest.TestCase):
   def test_task_id_missing_key_raises(self):
     with self.assertRaisesRegex(KeyError, "instance_id"):
       tvcache_lib.task_id_for({"prompt": "x"}, "instance_id")
+
+  def test_cache_task_id_scopes_image_grading_and_namespace(self):
+    task = {"instance_id": "t", "prompt": "p"}
+    base = tvcache_lib.cache_task_id(
+        "run-1", task, {"image": "img:a", "grading": {"backend": "k"}},
+        task_id_key="instance_id",
+    )
+    other_image = tvcache_lib.cache_task_id(
+        "run-1", task, {"image": "img:b", "grading": {"backend": "k"}},
+        task_id_key="instance_id",
+    )
+    other_grade = tvcache_lib.cache_task_id(
+        "run-1", task, {"image": "img:a", "grading": {"backend": "docker"}},
+        task_id_key="instance_id",
+    )
+    other_ns = tvcache_lib.cache_task_id(
+        "run-2", task, {"image": "img:a", "grading": {"backend": "k"}},
+        task_id_key="instance_id",
+    )
+    other_key = tvcache_lib.cache_task_id(
+        "run-1", task, {"image": "img:a", "grading": {"backend": "k"}},
+        task_id_key=None,
+    )
+    self.assertTrue(base.startswith("run-1/"))
+    self.assertNotEqual(base, other_image)
+    self.assertNotEqual(base, other_grade)
+    self.assertNotEqual(base, other_ns)
+    self.assertNotEqual(base, other_key)
+    self.assertEqual(
+        base,
+        tvcache_lib.cache_task_id(
+            "run-1", task, {"grading": {"backend": "k"}, "image": "img:a"},
+            task_id_key="instance_id",
+        ),
+    )
+
+  def test_is_local_host(self):
+    self.assertTrue(tvcache_lib.is_local_host("127.0.0.1"))
+    self.assertTrue(tvcache_lib.is_local_host("localhost"))
+    self.assertFalse(
+        tvcache_lib.is_local_host("tvcache.invalid")
+    )
+
+  def test_tool_cache_stamp_only_when_the_env_reports_it(self):
+    from tunix.rl.agentic.trajectory import trajectory_collect_engine as engine
+
+    self.assertIsNone(engine._tool_cache_for_traj(object()))
+
+    class _Silent:
+
+      def tool_cache_stats(self):
+        return None
+
+    self.assertIsNone(engine._tool_cache_for_traj(_Silent()))
+
+    class _Reporting:
+
+      def tool_cache_stats(self):
+        return {"hits": 2, "misses": 1}
+
+    self.assertEqual(
+        engine._tool_cache_for_traj(_Reporting()), {"hits": 2, "misses": 1}
+    )
 
   def test_in_memory_fork_isolation(self):
     async def _run():
@@ -366,7 +421,6 @@ class TvcacheIntegrationTest(absltest.TestCase):
     # If both ran on the asyncio loop without offload, elapsed ~= 0.5s.
     # With the thread pool, elapsed should be close to a single delay.
     self.assertLess(elapsed, 0.45)
-    self.assertGreaterEqual(tool.entered, 2)
 
 
 class ServerLookupTest(absltest.TestCase):

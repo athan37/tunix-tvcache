@@ -1,3 +1,21 @@
+# TVCache server. Built only when INSTALL_TVCACHE=true; otherwise this stage
+# writes an empty placeholder so the copy below still succeeds.
+ARG INSTALL_TVCACHE=false
+FROM rust:1.85-slim AS tvcache-rust
+ARG INSTALL_TVCACHE=false
+RUN mkdir -p /opt/tvcache/bin && \
+    if [ "$INSTALL_TVCACHE" = "true" ]; then \
+      apt-get update && apt-get install -y git pkg-config libssl-dev && \
+      rm -rf /var/lib/apt/lists/* && \
+      git clone https://github.com/abhivijay96/tvcache-rust.git /tmp/tvcache-rust && \
+      git -C /tmp/tvcache-rust checkout a5842617105d9061ff5c070c26ceedffb4a8bb26 && \
+      cargo build --release --manifest-path /tmp/tvcache-rust/Cargo.toml && \
+      cp /tmp/tvcache-rust/target/release/tvcache /opt/tvcache/bin/tvcache && \
+      rm -rf /tmp/tvcache-rust; \
+    else \
+      : > /opt/tvcache/bin/tvcache; \
+    fi
+
 # Base image with Python 3.12
 FROM python:3.12-slim
 
@@ -73,6 +91,17 @@ RUN if [ "$INSTALL_DEEPSWE_DEPS" = "true" ]; then \
       uv pip install --no-deps git+https://github.com/r2e-gym/r2e-gym.git@0d94c4eb9431cd195c55a7ea3abd54006c9a1735 && \
       sed -i 's/create_repo, upload_folder, HfFolder/create_repo, upload_folder/' /opt/venv/lib/python3.12/site-packages/r2egym/agenthub/utils/utils.py && \
       sed -i 's/self.commit = ParsedCommit(\*\*json.loads(self.commit_json))/self.commit = ParsedCommit(\*\*(json.loads(self.commit_json) if isinstance(self.commit_json, str) else self.commit_json))/' /opt/venv/lib/python3.12/site-packages/r2egym/agenthub/runtime/docker.py; \
+    fi
+
+# TVCache client and server binary. Off by default. The binary is copied from
+# the rust stage; only this flag installs it and the pinned tvclient.
+ARG INSTALL_TVCACHE=false
+COPY --from=tvcache-rust /opt/tvcache/bin/tvcache /opt/tvcache/bin/tvcache
+RUN if [ "$INSTALL_TVCACHE" = "true" ]; then \
+      chmod 755 /opt/tvcache/bin/tvcache && \
+      uv pip install "tvclient @ git+https://github.com/abhivijay96/tvclient.git@45d8c7d76dffca8d01a47315d14a82c4af9405f0"; \
+    else \
+      rm -rf /opt/tvcache; \
     fi
 
 # Build argument to conditionally install MaxText dependencies

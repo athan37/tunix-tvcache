@@ -103,7 +103,14 @@ class ToolEnvironmentTest(absltest.TestCase):
         )
         env.reset()
         bridge_cls.assert_called_once()
-        self.assertEqual(bridge_cls.call_args.args[1], "same")
+        self.assertEqual(
+            bridge_cls.call_args.args[1],
+            tvcache_lib.cache_task_id(
+                "",
+                {"prompt": "p", "instance_id": "same"},
+                task_id_key="instance_id",
+            ),
+        )
         # No rollout_id kwarg.
         self.assertEqual(bridge_cls.call_args.kwargs, {})
 
@@ -141,6 +148,73 @@ class ToolEnvironmentTest(absltest.TestCase):
         env.reset()
         env.close()
     self.assertEqual(task_ids[0], task_ids[1])
+
+
+  def test_insert_failure_uses_the_shared_bridge_fallback(self):
+    try:
+      import tvclient  # pylint: disable=g-import-not-at-top,unused-import
+    except ImportError:
+      self.skipTest("tvclient is not installed")
+    from tests.rl.agentic.tools import tvcache_recovery_test as recovery
+    from tunix.rl.agentic.tools import base_tool
+
+    class _Edit(base_tool.BaseTool):
+
+      def get_json_schema(self):
+        return {"type": "function", "function": {"name": self.name}}
+
+      def apply(self, **kwargs):
+        del kwargs
+        return base_tool.ToolOutput(name=self.name, output="unused")
+
+    recovery.CountingSandbox.reset()
+    tvcache_lib.reset_connect_backoff_for_test()
+    edit = tvcache_lib.make_cached_tool_call("edit", {}, mutates=True)
+    client = recovery.ScriptedClient()
+    client.find_results = ["edited", None]
+    client.fail_insert_paths.add((edit.serialize(),))
+    config = tvcache_lib.TvcacheConfig(
+        host="127.0.0.1", port=9, snapshot=False, connect_timeout_s=0.2
+    )
+    env = tool_environment.ToolEnvironment(
+        task={"prompt": "p"},
+        tool_map={
+            "edit": _Edit,
+            "calculator": calculator_tool.CalculatorTool,
+        },
+        tvcache=config,
+    )
+    env.reset()
+    bridge = tvcache_lib.TvcacheBridge(
+        config, "task", sandbox_cls=recovery.CountingSandbox
+    )
+    bridge._adapter.bind_client(client)  # pylint: disable=protected-access
+    env._tvcache_bridge.close()  # pylint: disable=protected-access
+    env._tvcache_bridge = bridge  # pylint: disable=protected-access
+    calls = [edit]
+    tools = {tool.name: tool for tool in env.tool_manager.get_tools()}
+    real_make = tvcache_lib.make_tool_call
+
+    def _make(tool, call):
+      del tool
+      if calls and call.name == "edit":
+        return calls.pop(0)
+      return real_make(tools[call.name], call)
+
+    with mock.patch.object(tvcache_lib, "make_tool_call", side_effect=_make):
+      obs, _reward, _done, _info = env.step([
+          _tool_call("edit", {}, "e1"),
+          _tool_call("calculator", {"a": 1, "b": 1, "op": "+"}, "c1"),
+      ])
+    outputs = obs["tool_outputs"]
+    self.assertEqual(outputs["e1"], "edited")
+    self.assertIn("c1", outputs)
+    sandbox = bridge._bypass_sandbox  # pylint: disable=protected-access
+    executed = [getattr(call, "name", "") for call in sandbox.executed]
+    self.assertEqual(executed.count("edit"), 1)
+    self.assertEqual(executed.count("calculator"), 1)
+    env.close()
+    self.assertEqual(sandbox.stops, 1)
 
 
 def _fake_tool_call(tool, call):

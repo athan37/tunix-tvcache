@@ -134,10 +134,12 @@ agentic_grpo_config:
 
 reward_functions: []
 
-# Set enable_tool_cache: true to reuse repeated tool results. An existing
-# local binary is used directly. Tunix downloads and builds the server only
-# when this computer has none. Local target and one rollout replica only. See
-# base_dist_config.yaml.
+# Set enable_tool_cache: true to reuse repeated tool results. Left commented so
+# the cache stays off. On Kubernetes also set cluster_config.run_id and build
+# the image with INSTALL_TVCACHE=true. snapshot stays false: one Deployment
+# serves every rollout replica. A cache outage falls open (the episode
+# continues uncached) unless workspace recovery fails. See
+# base_dist_config.yaml and docs/agentic_rl.md.
 # enable_tool_cache: true
 
 env_class_path: "deepswe_env"

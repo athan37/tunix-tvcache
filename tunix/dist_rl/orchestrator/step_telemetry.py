@@ -167,6 +167,14 @@ def _rollout_window(item: datatypes.TrajectoryItem) -> RolloutWindow | None:
   )
 
 
+def _tool_cache(traj: Mapping[str, Any]) -> Mapping[str, int] | None:
+  """Reads `tool_cache` counters, or None when the episode did not report any."""
+  raw = traj.get("tool_cache")
+  if not isinstance(raw, Mapping) or not raw:
+    return None
+  return {str(key): int(value) for key, value in raw.items()}
+
+
 def _env_time_s(traj: Mapping[str, Any]) -> float | None:
   """Sums `reset_latency`, `step_latency`, and `close_latency` from `env_time`."""
   env_time = traj.get("env_time")
@@ -215,6 +223,8 @@ class RolloutFacts:
     task_name: Semantic task name from lineage, or `""` when unset.
     env_time_s: Total environment interaction wall time (`reset` + `step` +
       `close`) in seconds, or None without `env_time`.
+    tool_cache: Episode cache counters from `traj["tool_cache"]`, or None
+      when the environment did not report them.
   """
 
   traj_id: str
@@ -225,6 +235,7 @@ class RolloutFacts:
   prompt_id: Hashable | None = None
   task_name: str = ""
   env_time_s: float | None = None
+  tool_cache: Mapping[str, int] | None = None
 
   @classmethod
   def of(cls, item: datatypes.TrajectoryItem) -> "RolloutFacts":
@@ -260,6 +271,7 @@ class RolloutFacts:
         window=_rollout_window(item),
         task_name=task_name,
         env_time_s=_env_time_s(traj),
+        tool_cache=_tool_cache(traj),
     )
 
 
@@ -348,6 +360,8 @@ def rollout_health(facts: Sequence[RolloutFacts]) -> RolloutHealth:
   turn_lengths: list[int] = []
   windows: list[RolloutWindow] = []
   env_times: list[float] = []
+  cache_totals: dict[str, int] = {}
+  cache_episodes = 0
   by_prompt: collections.defaultdict[
       tuple[int | None, Hashable], list[RolloutWindow]
   ] = collections.defaultdict(list)
@@ -363,8 +377,28 @@ def rollout_health(facts: Sequence[RolloutFacts]) -> RolloutHealth:
         by_prompt[(fact.window.batch_idx, fact.prompt_id)].append(fact.window)
     if fact.env_time_s is not None:
       env_times.append(fact.env_time_s)
+    if fact.tool_cache is not None:
+      cache_episodes += 1
+      for key, value in fact.tool_cache.items():
+        cache_totals[key] = cache_totals.get(key, 0) + int(value)
 
   metrics: dict[str, float] = {}
+  if cache_episodes:
+    lookups = cache_totals.get("hits", 0) + cache_totals.get("misses", 0)
+    metrics["rollout/tvcache/hit_frac"] = (
+        cache_totals.get("hits", 0) / lookups if lookups else 0.0
+    )
+    metrics["rollout/tvcache/grading_hit_frac"] = (
+        cache_totals.get("grading_hit", 0) / cache_episodes
+    )
+    metrics["rollout/tvcache/fallback"] = float(
+        cache_totals.get("fallback_completed", 0)
+        + cache_totals.get("fallback_not_started", 0)
+        + cache_totals.get("fallback_error", 0)
+    )
+    metrics["rollout/tvcache/bypassed"] = float(
+        cache_totals.get("bypassed", 0)
+    )
   if facts:
     for name, count in status_counts.items():
       metrics[f"rollout/status/{name.lower()}_frac"] = count / len(facts)
@@ -440,6 +474,41 @@ def rollout_health(facts: Sequence[RolloutFacts]) -> RolloutHealth:
         metrics, "rollout/worker_queue_wait_sec", worker_queue_waits
     )
   return RolloutHealth(metrics=metrics, status_counts=status_counts)
+
+
+def tool_cache_summary(facts: Sequence[RolloutFacts]) -> str | None:
+  """One line of TVCache hit, grading-hit, fallback, and bypass counts.
+
+  Args:
+    facts: The step's scored rollouts.
+
+  Returns:
+    `tvcache hit=..% grade_hit=..% fallback=.. bypassed=..`, or None when no
+    rollout reported cache counters.
+  """
+  totals: dict[str, int] = {}
+  episodes = 0
+  for fact in facts:
+    if fact.tool_cache is None:
+      continue
+    episodes += 1
+    for key, value in fact.tool_cache.items():
+      totals[key] = totals.get(key, 0) + int(value)
+  if not episodes:
+    return None
+  lookups = totals.get("hits", 0) + totals.get("misses", 0)
+  hit = totals.get("hits", 0) / lookups if lookups else 0.0
+  grade = totals.get("grading_hit", 0) / episodes
+  fallback = (
+      totals.get("fallback_completed", 0)
+      + totals.get("fallback_not_started", 0)
+      + totals.get("fallback_error", 0)
+  )
+  bypassed = totals.get("bypassed", 0)
+  return (
+      f"tvcache hit={hit:.0%} grade_hit={grade:.0%} "
+      f"fallback={fallback} bypassed={bypassed}"
+  )
 
 
 def slowest_rollouts_summary(

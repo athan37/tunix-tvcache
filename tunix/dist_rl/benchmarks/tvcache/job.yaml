@@ -1,0 +1,59 @@
+# Indexed Job for the cache-on replay. Both this Job and the one-shot
+# dump_all Pod must carry tunix.dev/tvcache-bench=<run_id>, which is the
+# NetworkPolicy rule in jobset.tvcache.yaml. A Pod without the label is
+# refused; the harness checks that before the passes start.
+#
+# Shard the 16 episodes the way Tunix stripes them: 2 samples of each of the
+# 2 tasks on each of 4 Pods. completions and parallelism are 4.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tvcache-replay
+  labels:
+    tunix.dev/tvcache-bench: RUN_ID
+    tunix.dev/run-id: RUN_ID
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        tunix.dev/tvcache-bench: RUN_ID
+        tunix.dev/run-id: RUN_ID
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: replay
+        image: TUNIX_IMAGE
+        env:
+        - name: JOB_COMPLETION_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        command:
+        - python
+        - -m
+        - tunix.dist_rl.benchmarks.tvcache.replay
+        args:
+        - --run-id=RUN_ID
+        - --cache-host=TVCACHE_ID
+        - --episodes=/data/episodes.json
+        - --out=/data/summary.json
+---
+# One-shot Pod that calls dump_all inside the cluster. Same label, so the
+# policy admits it. Do not port-forward.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tvcache-dump
+  labels:
+    tunix.dev/tvcache-bench: RUN_ID
+    tunix.dev/run-id: RUN_ID
+spec:
+  restartPolicy: Never
+  containers:
+  - name: dump
+    image: TUNIX_IMAGE
+    command: ["python", "-m", "tunix.dist_rl.benchmarks.tvcache.replay"]
+    args: ["--dump", "--run-id=RUN_ID", "--cache-host=TVCACHE_ID"]

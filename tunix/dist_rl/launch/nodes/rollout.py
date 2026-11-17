@@ -782,6 +782,24 @@ def _create_rollout_worker(
   rollout_engine = str(hp.config["rollout_engine"])
   config = _rollout_config(hp, tokenizer, sampler_type=rollout_engine)
   sampler = _SAMPLER_BUILDERS[rollout_engine](hp, worker_id, tokenizer, config)
+  env_config = hp.config_mapping("env_kwargs")
+  max_concurrency = int(
+      hp.config_mapping("agentic_grpo_config")["max_concurrency"]
+  )
+  tvcache = hp.config_mapping("tvcache_config")
+  if tvcache["enable"]:
+    # Env adapters (ToolEnvironment / SWEEnv) accept this as TvcacheConfig.
+    from tunix.rl.agentic.tools import tvcache as tvcache_lib  # pylint: disable=g-import-not-at-top
+
+    tvcache_lib.ensure_local_server(port=int(tvcache["port"]))
+    tvcache_lib.configure_thread_pool(max_concurrency)
+    env_config["tvcache"] = {
+        "host": tvcache["host"],
+        "port": int(tvcache["port"]),
+        "sandbox_class": tvcache["sandbox_class"],
+        "task_id_key": tvcache["task_id_key"],
+        "snapshot": bool(tvcache["snapshot"]),
+    }
   logging.info("Creating RolloutWorker wrapper...")
   return rollout_worker.RolloutWorker(
       worker_id=worker_id,
@@ -791,11 +809,9 @@ def _create_rollout_worker(
       chat_parser=_create_chat_parser(hp, tokenizer),
       env_name=str(hp.config["env_class_path"]),
       agent_name=str(hp.config["agent_class_path"]),
-      env_config=hp.config_mapping("env_kwargs"),
+      env_config=env_config,
       agent_config=hp.config_mapping("agent_kwargs"),
-      max_concurrency=int(
-          hp.config_mapping("agentic_grpo_config")["max_concurrency"]
-      ),
+      max_concurrency=max_concurrency,
   )
 
 
@@ -869,6 +885,38 @@ def main(
     logging.info("Creating rollout worker service...")
     worker_service = _create_rollout_worker(hp, worker_id, tokenizer)
 
+    drain_task = None
+    drain_stop = None
+    tvcache = hp.config_mapping("tvcache_config")
+    if tvcache["enable"]:
+      from tunix.rl.agentic.tools import tvcache as tvcache_lib  # pylint: disable=g-import-not-at-top
+
+      tvclient = tvcache_lib._require_tvclient()  # pylint: disable=protected-access
+      module_path, class_name = str(tvcache["sandbox_class"]).rsplit(".", 1)
+      sandbox_cls = getattr(importlib.import_module(module_path), class_name)
+      manager = tvclient.SandboxManager(
+          sandbox_cls,
+          host=str(tvcache["host"]),
+          port=int(tvcache["port"]),
+      )
+      drain_stop = asyncio.Event()
+
+      async def _run_manager() -> None:
+        await manager.client.connect()
+        try:
+          await manager.run_drain_loop(
+              interval_seconds=5.0, stop_event=drain_stop
+          )
+        finally:
+          await manager.close()
+
+      logging.info(
+          "Starting TVCache SandboxManager drain loop at %s:%s",
+          tvcache["host"],
+          tvcache["port"],
+      )
+      drain_task = asyncio.create_task(_run_manager())
+
     async def _drain() -> None:
       # Cancel in-flight trajectory collections, then shut down the engine. The
       # engine is shut down even if `stop()` raises (e.g. it re-raises an
@@ -876,7 +924,13 @@ def main(
       try:
         worker_service.stop()
       finally:
-        await worker_service.sampler.stop()
+        try:
+          await worker_service.sampler.stop()
+        finally:
+          if drain_stop is not None:
+            drain_stop.set()
+          if drain_task is not None:
+            await drain_task
 
     await node_utils.serve_worker(
         worker_service,

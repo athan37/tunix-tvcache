@@ -65,6 +65,62 @@ their interface (parameters, description) and either `apply()` (synchronous) or
 discovers, registers, and executes tools by name. It can execute multiple tool
 calls in parallel for efficiency.
 
+### Tool value cache (TVCache)
+
+Tunix can optionally cache tool results across rollouts of the same task with
+[TVCache](https://arxiv.org/abs/2602.10986). The cache keys each result by the
+sequence of **state-mutating** tool calls so far, so identical prefixes are
+executed once instead of once per GRPO sample.
+
+**Tool contract.** Every tool may declare:
+
+*   `will_mutate_state(**kwargs) -> bool` — whether this call changes the
+    environment. The default is `True` (safe). Stateless tools such as the
+    calculator return `False`. Marking a mutating call as `False` can reuse a
+    result from the wrong sandbox state.
+*   `apply_in_sandbox(sandbox, **kwargs)` — run against a TVCache sandbox.
+    Stateful tools read or write `sandbox` state here; the default ignores the
+    sandbox and calls `apply`.
+
+**Sandbox.** Mutable state lives in a class constructed as `(task_name, env_id)`
+with `start`, `fork`, `execute`, and `stop`. Tunix ships
+`tunix.rl.agentic.tools.tvcache.InMemoryToolSandbox` for tests and examples.
+On a cache miss, TVCache forks the deepest cached snapshot and runs only the
+missing suffix.
+
+**Local launch.** Install the client with
+`pip install 'google-tunix[tvcache]'`, then turn the cache on:
+
+```yaml
+enable_tool_cache: true
+```
+
+The DeepSWE notebooks take the same switch as `--enable_tool_cache`. A
+`tvcache` program already on `PATH`, in `TVCACHE_BINARY`, or in the Python
+environment's `bin` is used directly. A macOS arm64 or Linux x86-64 binary
+placed beside the package is used after that. Tunix downloads and builds the
+server only when this computer has none of those. It starts the server when port 7878 is closed and stops a server it
+started when the process exits. A server that is already listening is reused.
+An environment that does not accept `tvcache`, such as GSM8K, logs a warning
+and continues without the server. DeepSWE still uses the cache, because
+`DeepSWEEnv` forwards `tvcache` to `SWEEnv`.
+
+`local.sh` still starts the server for a distributed local run. The rollout
+node runs the single `SandboxManager` drain loop and sizes the TVCache thread
+pool to `max_concurrency`. Currently `cluster_config.target=local` with
+`rollout_replicas=1` only.
+
+Advanced overrides live under `tvcache_config` (host, port, eviction, and
+`server_binary`). Leave `server_binary` empty to use the lookup above.
+`snapshot: false` is value-only. Set `snapshot: true` only for docker-commit
+forks. `SWEEnv` always binds its own `R2EGymSandbox`; `snapshot` and
+`task_id_key` (default `instance_id`) are the knobs that matter. Final grading
+goes through `executor.test` so a cache hit cannot score a sandbox that fell
+behind.
+
+The tool-value cache is **not** cleared on weight sync: it keys environment
+state, not model weights.
+
 ### Agent/Environment interaction
 
 ![Agent/Environment interaction](images/agentic_agent:env.png)

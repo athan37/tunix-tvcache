@@ -20,6 +20,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from unittest import mock
 
 from absl.testing import absltest
@@ -28,6 +29,13 @@ from tunix.cli import config as cli_config
 from tunix.dist_rl.common import execution_target
 from tunix.dist_rl.common import gcs_cache
 from tunix.dist_rl.launch.common import resolve_config
+
+# `ForwardingToolEnv` only has **kwargs, like DeepSWEEnv.
+_TOOL_CACHE_ENV = (
+    "env_class_path=resolve_tool_env",
+    "cluster_config.registry_module="
+    "tests.dist_rl.launch.common.tool_cache_envs",
+)
 
 
 class ResolveConfigTest(absltest.TestCase):
@@ -1901,6 +1909,145 @@ weight_sync_config:
       with self.subTest(overrides=overrides):
         with self.assertRaisesRegex(exc_type, pattern):
           resolve_config.initialize(overrides)
+
+  def test_tvcache_disabled_by_default(self):
+    hp = resolve_config.initialize([])
+    self.assertFalse(hp.config_mapping("tvcache_config")["enable"])
+    self.assertFalse(hp.config_mapping("tvcache_config")["snapshot"])
+    exports = resolve_config.render_bash_exports(hp)
+    self.assertIn("export TVCACHE_ENABLE=false\n", exports)
+    self.assertIn("export TVCACHE_PORT=7878\n", exports)
+
+  def test_tvcache_rejects_k8s(self):
+    with self.assertRaisesRegex(ValueError, "only supported for"):
+      resolve_config.initialize([
+          "tvcache_config.enable=true",
+          "tvcache_config.server_binary=/tmp/tvcache",
+          "cluster_config.target=k8s",
+          "agentic_grpo_config.beta=0.0",
+          *_TOOL_CACHE_ENV,
+      ])
+
+  def test_tvcache_rejects_empty_binary(self):
+    with mock.patch.dict(os.environ, {"TVCACHE_BINARY": ""}):
+      with mock.patch(
+          "tunix.rl.agentic.tools.tvcache._is_executable", return_value=False
+      ):
+        with mock.patch(
+            "tunix.rl.agentic.tools.tvcache.shutil.which", return_value=None
+        ):
+          with self.assertRaisesRegex(ValueError, "rustup"):
+            resolve_config.initialize([
+                "tvcache_config.enable=true",
+                "cluster_config.target=local",
+                "agentic_grpo_config.beta=0.0",
+                *_TOOL_CACHE_ENV,
+            ])
+
+  def test_enable_tool_cache_resolves_binary(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      binary = os.path.join(tmp, "tvcache")
+      with open(binary, "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/sh\n")
+      os.chmod(binary, 0o755)
+      with mock.patch.dict(os.environ, {"TVCACHE_BINARY": binary}):
+        hp = resolve_config.initialize([
+            "enable_tool_cache=true",
+            "cluster_config.target=local",
+            "agentic_grpo_config.beta=0.0",
+            *_TOOL_CACHE_ENV,
+        ])
+    self.assertTrue(hp.config_mapping("tvcache_config")["enable"])
+    self.assertEqual(hp.config_mapping("tvcache_config")["server_binary"], binary)
+    exports = resolve_config.render_bash_exports(hp)
+    self.assertIn("export TVCACHE_ENABLE=true\n", exports)
+    self.assertIn(f"export TVCACHE_BINARY={binary}\n", exports)
+
+  def test_enable_tool_cache_builds_when_the_server_is_missing(self):
+    with mock.patch.dict(os.environ, {"TVCACHE_BINARY": ""}):
+      with mock.patch(
+          "tunix.rl.agentic.tools.tvcache.find_server_binary",
+          side_effect=FileNotFoundError("tvcache server was not found"),
+      ):
+        with mock.patch(
+            "tunix.rl.agentic.tools.tvcache.install_server_binary",
+            return_value="/cache/tvcache",
+        ) as install:
+          hp = resolve_config.initialize([
+              "enable_tool_cache=true",
+              "cluster_config.target=local",
+              "agentic_grpo_config.beta=0.0",
+              *_TOOL_CACHE_ENV,
+          ])
+    install.assert_called_once()
+    self.assertEqual(
+        hp.config_mapping("tvcache_config")["server_binary"], "/cache/tvcache"
+    )
+    exports = resolve_config.render_bash_exports(hp)
+    self.assertIn("export TVCACHE_BINARY=/cache/tvcache\n", exports)
+
+  def test_enable_tool_cache_skips_env_without_tool_calls(self):
+    with mock.patch(
+        "tunix.rl.agentic.tools.tvcache.install_server_binary"
+    ) as install:
+      with self.assertLogs(resolve_config.logger, level="WARNING") as logs:
+        hp = resolve_config.initialize([
+            "enable_tool_cache=true",
+            "env_class_path=resolve_plain_env",
+            "cluster_config.registry_module="
+            "tests.dist_rl.launch.common.tool_cache_envs",
+            "cluster_config.target=local",
+            "agentic_grpo_config.beta=0.0",
+        ])
+    install.assert_not_called()
+    self.assertFalse(hp.config_mapping("tvcache_config")["enable"])
+    exports = resolve_config.render_bash_exports(hp)
+    self.assertIn("export TVCACHE_ENABLE=false\n", exports)
+    self.assertIn("PlainMathEnv", "\n".join(logs.output))
+    self.assertIn("does not make tool calls", "\n".join(logs.output))
+
+  def test_enable_tool_cache_keeps_env_that_forwards_tvcache(self):
+    hp = resolve_config.initialize([
+        "enable_tool_cache=true",
+        "tvcache_config.server_binary=/tmp/tvcache",
+        "env_class_path=resolve_forwarding_env",
+        "cluster_config.registry_module="
+        "tests.dist_rl.launch.common.tool_cache_envs",
+        "cluster_config.target=local",
+        "agentic_grpo_config.beta=0.0",
+    ])
+    self.assertTrue(hp.config_mapping("tvcache_config")["enable"])
+
+  def test_enable_tool_cache_skips_gsm8k(self):
+    with mock.patch(
+        "tunix.rl.agentic.tools.tvcache.install_server_binary"
+    ) as install:
+      with self.assertLogs(resolve_config.logger, level="WARNING") as logs:
+        hp = resolve_config.initialize([
+            "enable_tool_cache=true",
+            "cluster_config.target=local",
+            "agentic_grpo_config.beta=0.0",
+        ])
+    install.assert_not_called()
+    self.assertFalse(hp.config_mapping("tvcache_config")["enable"])
+    self.assertIn("GSM8KEnv", "\n".join(logs.output))
+
+  def test_tvcache_exports_when_enabled(self):
+    hp = resolve_config.initialize([
+        "tvcache_config.enable=true",
+        "tvcache_config.server_binary=/usr/local/bin/tvcache",
+        "tvcache_config.port=7879",
+        "tvcache_config.snapshot=true",
+        "cluster_config.target=local",
+        "agentic_grpo_config.beta=0.0",
+        *_TOOL_CACHE_ENV,
+    ])
+    exports = resolve_config.render_bash_exports(hp)
+    self.assertIn("export TVCACHE_ENABLE=true\n", exports)
+    self.assertIn("export TVCACHE_BINARY=/usr/local/bin/tvcache\n", exports)
+    self.assertIn("export TVCACHE_PORT=7879\n", exports)
+    self.assertIn("export TVCACHE_EVICTION_POLICY=ttl_and_watermark\n", exports)
+    self.assertTrue(hp.config_mapping("tvcache_config")["snapshot"])
 
 
 if __name__ == "__main__":

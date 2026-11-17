@@ -21,6 +21,7 @@ framework.
 """
 
 import json
+from collections.abc import Mapping
 from typing import Any, Dict, List
 import uuid
 
@@ -44,6 +45,9 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
   automatic episode termination through 'finish' tool calls or reaching
   `max_steps`, and flexible reward function integration for various
   evaluation strategies.
+
+  When ``tvcache`` is configured, tool calls are routed through TVCache
+  for stateful result reuse across rollouts of the same task.
   """
 
   def __init__(
@@ -53,6 +57,7 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
       tool_map: Dict[str, type[base_tool.BaseTool]],
       reward_fn=None,
       max_steps: int = 10,
+      tvcache: Mapping[str, Any] | Any | None = None,
       **kwargs,
   ):
     """Initialize the tool environment with task configuration and constraints.
@@ -67,6 +72,8 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
         None, defaults to `dummy_reward` with a warning.
       max_steps (int): Maximum number of interaction steps before forced
         termination. Prevents infinite loops and controls episode length.
+      tvcache: Optional TVCache config (``TvcacheConfig``, mapping, or None).
+        When set, tool calls are looked up / executed through tvclient.
       **kwargs: Additional arguments reserved for future extensions.
     """
     if reward_fn is None:
@@ -86,6 +93,27 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
 
     # Tool execution system for managing available tools and their invocation.
     self.tool_manager = tool_manager.ToolManager(tool_map)
+    self._tvcache_config = self._normalize_tvcache_config(tvcache)
+    self._tvcache_bridge = None
+
+  @staticmethod
+  def _normalize_tvcache_config(
+      tvcache: Mapping[str, Any] | Any | None,
+  ) -> Any | None:
+    """Converts a mapping into TvcacheConfig, or passes a config through."""
+    if tvcache is None:
+      return None
+    # Lazy import so ToolEnvironment works without the tvcache extra.
+    from tunix.rl.agentic.tools import tvcache as tvcache_lib  # pylint: disable=g-import-not-at-top
+
+    if isinstance(tvcache, tvcache_lib.TvcacheConfig):
+      return tvcache
+    if isinstance(tvcache, Mapping):
+      return tvcache_lib.TvcacheConfig(**tvcache)
+    raise TypeError(
+        "tvcache must be a TvcacheConfig, mapping, or None; "
+        f"got {type(tvcache)!r}"
+    )
 
   def _initial_observation(self) -> Dict[str, Any]:
     """Reset the environment to initial state for a new episode.
@@ -97,7 +125,25 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
     Returns:
       Dict[str, Any]: The task specification as the initial observation.
     """
+    self._reset_tvcache_episode()
     return self.task
+
+  def _reset_tvcache_episode(self) -> None:
+    """Creates a fresh TVCache bridge for this episode when caching is on."""
+    if self._tvcache_bridge is not None:
+      self._tvcache_bridge.close()
+      self._tvcache_bridge = None
+    if self._tvcache_config is None:
+      return
+
+    from tunix.rl.agentic.tools import tvcache as tvcache_lib  # pylint: disable=g-import-not-at-top
+
+    task_id = tvcache_lib.task_id_for(
+        self.task or {}, self._tvcache_config.task_id_key
+    )
+    self._tvcache_bridge = tvcache_lib.TvcacheBridge(
+        self._tvcache_config, task_id
+    )
 
   def _step_impl(self, action: Any) -> base_environment.EnvStepResult:
     """Execute one logical step of tool interaction based on agent's action.
@@ -191,7 +237,8 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
 
     Converts raw tool call dictionaries to ToolCall objects, assigns
     unique IDs if missing, and delegates execution to the ToolManager
-    with parallel execution enabled for performance.
+    with parallel execution enabled for performance. When a TVCache bridge
+    is active, the same calls run sequentially through the cache.
 
     Args:
       tool_calls (List[Dict[str, Any]]): List of tool call specifications
@@ -211,7 +258,39 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
       setattr(call_obj, "id", call_id)
       call_objs.append(call_obj)
 
-    return self.tool_manager.execute_calls(call_objs, parallel=True)
+    if self._tvcache_bridge is None:
+      return self.tool_manager.execute_calls(call_objs, parallel=True)
+    return self._execute_tool_calls_cached(call_objs)
+
+  def _execute_tool_calls_cached(
+      self, call_objs: List[base_tool.ToolCall]
+  ) -> Dict[str, str]:
+    """Runs tool calls one-by-one through TVCache in model order."""
+    from tunix.rl.agentic.tools import tvcache as tvcache_lib  # pylint: disable=g-import-not-at-top
+
+    assert self._tvcache_bridge is not None
+    outputs: dict[str, str] = {}
+    tools_by_name = {tool.name: tool for tool in self.tool_manager.get_tools()}
+
+    for call_obj in call_objs:
+      call_id = getattr(call_obj, "id")
+      tool = tools_by_name.get(call_obj.name)
+      if tool is None:
+        outputs[call_id] = f"Error: Tool '{call_obj.name}' not registered."
+        continue
+
+      outputs[call_id] = self._tvcache_bridge.call(
+          tvcache_lib.make_tool_call(tool, call_obj)
+      )
+
+    return outputs
+
+  def close(self) -> None:
+    """Closes the TVCache bridge if one is open."""
+    if self._tvcache_bridge is not None:
+      self._tvcache_bridge.close()
+      self._tvcache_bridge = None
+    super().close()
 
   @classmethod
   def from_dict(cls, env_args: Dict[str, Any]) -> "ToolEnvironment":
@@ -224,6 +303,7 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
       * `tool_map` (required) specifies the available tools.
       * `reward_fn` (optional) overrides the default reward function.
       * `max_steps` (optional, defaults to 10) controls episode length.
+      * `tvcache` (optional) enables the TVCache tool-value cache.
       * Any other entries become part of the `task` specification.
 
     Args:
@@ -236,6 +316,7 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
     tool_map = env_args.pop("tool_map", None)
     reward_fn = env_args.pop("reward_fn", None)
     max_steps = env_args.pop("max_steps", 10)
+    tvcache = env_args.pop("tvcache", None)
 
     # Remaining entries form the task specification.
     task = env_args
@@ -245,4 +326,5 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
         tool_map=tool_map,
         reward_fn=reward_fn,
         max_steps=max_steps,
+        tvcache=tvcache,
     )

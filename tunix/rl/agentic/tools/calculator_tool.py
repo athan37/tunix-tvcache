@@ -70,6 +70,11 @@ class CalculatorTool(base_tool.BaseTool):
         },
     }
 
+  def will_mutate_state(self, **kwargs: Any) -> bool:
+    """Calculator results depend only on arguments; they never mutate state."""
+    del kwargs
+    return False
+
   def apply(self, **kwargs: Any) -> base_tool.ToolOutput:
     """Execute the arithmetic operation with the provided operands and operator.
 

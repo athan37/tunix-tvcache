@@ -134,6 +134,12 @@ agentic_grpo_config:
 
 reward_functions: []
 
+# Set enable_tool_cache: true to reuse repeated tool results. An existing
+# local binary is used directly. Tunix downloads and builds the server only
+# when this computer has none. Local target and one rollout replica only. See
+# base_dist_config.yaml.
+# enable_tool_cache: true
+
 env_class_path: "deepswe_env"
 # `DeepSWEEnv` settings for the whole run; each task record adds `entry` and
 # `prompt_id` through `metadata.env_config`.

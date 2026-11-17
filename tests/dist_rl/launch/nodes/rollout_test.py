@@ -39,6 +39,13 @@ from tunix.models import automodel
 from tunix.rl.agentic.parser.chat_template_parser import parser
 from tunix.utils import maxtext_utils
 
+_TOOL_CACHE_ENV = (
+    "env_class_path=resolve_tool_env",
+    "cluster_config.registry_module="
+    "tests.dist_rl.launch.common.tool_cache_envs",
+)
+
+
 # A MaxText rollout gets real weights only from a MaxText trainer over Raiden.
 _MAXTEXT_ROLLOUT_ARGV = (
     "model_config.model_source=maxtext",
@@ -598,6 +605,62 @@ class CreateRolloutWorkerTest(absltest.TestCase):
     self.assertEqual(
         worker_kwargs["agent_config"], {"use_multistep_prompt": True}
     )
+
+  def test_worker_env_config_includes_tvcache_when_enabled(self):
+    with mock.patch.object(vllm_sampler, "VllmSampler", autospec=True):
+      with mock.patch(
+          "tunix.rl.agentic.tools.tvcache.ensure_local_server"
+      ) as ensure:
+        rollout._create_rollout_worker(
+            _hp(
+                "rollout_engine=vllm",
+                "tvcache_config.enable=true",
+                "tvcache_config.server_binary=/tmp/tvcache",
+                "tvcache_config.host=127.0.0.1",
+                "tvcache_config.port=7878",
+                "tvcache_config.task_id_key=instance_id",
+                "cluster_config.target=local",
+                "agentic_grpo_config.beta=0.0",
+                *_TOOL_CACHE_ENV,
+            ),
+            "rollout-0",
+            self.tokenizer,
+        )
+    ensure.assert_called_once_with(port=7878)
+    self.assertEqual(
+        self._worker_kwargs()["env_config"]["tvcache"],
+        {
+            "host": "127.0.0.1",
+            "port": 7878,
+            "sandbox_class": (
+                "tunix.rl.agentic.tools.tvcache.InMemoryToolSandbox"
+            ),
+            "task_id_key": "instance_id",
+            "snapshot": False,
+        },
+    )
+
+  def test_worker_skips_tvcache_when_env_has_no_tool_calls(self):
+    with mock.patch.object(vllm_sampler, "VllmSampler", autospec=True):
+      with mock.patch(
+          "tunix.rl.agentic.tools.tvcache.ensure_local_server"
+      ) as ensure:
+        rollout._create_rollout_worker(
+            _hp(
+                "rollout_engine=vllm",
+                "tvcache_config.enable=true",
+                "tvcache_config.server_binary=/tmp/tvcache",
+                "cluster_config.target=local",
+                "agentic_grpo_config.beta=0.0",
+                "env_class_path=resolve_plain_env",
+                "cluster_config.registry_module="
+                "tests.dist_rl.launch.common.tool_cache_envs",
+            ),
+            "rollout-0",
+            self.tokenizer,
+        )
+    ensure.assert_not_called()
+    self.assertNotIn("tvcache", self._worker_kwargs()["env_config"])
 
   def test_inprocess_vllm_builds_inprocess_sampler(self):
     with (

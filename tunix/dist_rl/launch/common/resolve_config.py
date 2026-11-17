@@ -31,7 +31,9 @@ from collections.abc import Mapping, MutableMapping, Sequence
 import datetime
 import getpass
 import hashlib
+import importlib
 import json
+import logging
 import math
 import os
 import pathlib
@@ -49,6 +51,8 @@ from tunix.dist_rl.common import datatypes as dist_rl_datatypes
 from tunix.dist_rl.common import execution_target
 from tunix.dist_rl.common import gcs_cache
 from tunix.dist_rl.distributed.deployment import yaml_generator
+
+logger = logging.getLogger(__name__)
 
 LAUNCH_DIR = pathlib.Path(__file__).parent
 REPO_ROOT = LAUNCH_DIR.parents[3]
@@ -611,6 +615,103 @@ def _validate_rollout_replicas(hp: cli_config.HyperParameters) -> None:
     )
 
 
+def _tool_cache_env_class(hp: cli_config.HyperParameters) -> type | None:
+  """Returns the rollout env class, or None when it cannot be resolved.
+
+  Unresolved classes are left alone. The cache stays under the existing
+  checks instead of guessing that a tool environment has no tool calls.
+
+  Args:
+    hp: Loaded configuration.
+  """
+  name = str(hp.config.get("env_class_path") or "").strip()
+  module_name = str(
+      hp.config_mapping("cluster_config").get("registry_module") or ""
+  ).strip()
+  if not name or not module_name:
+    return None
+  try:
+    importlib.import_module(module_name)
+  except (ImportError, ModuleNotFoundError):
+    return None
+  from tunix.dist_rl.common import registry  # pylint: disable=g-import-not-at-top
+
+  try:
+    return registry.ENV_REGISTRY.get(name)
+  except KeyError:
+    return None
+
+
+def _validate_tvcache_config(hp: cli_config.HyperParameters) -> None:
+  """Checks `tvcache_config` when the tool-value cache is enabled.
+
+  `enable_tool_cache: true` turns `tvcache_config.enable` on. An empty
+  `server_binary` is filled by finding the server or building it on first use.
+  An environment that does not accept `tvcache` logs a warning and turns the
+  cache off, so the server is not built or started.
+
+  Args:
+    hp: Loaded configuration.
+
+  Raises:
+    ValueError: If TVCache is enabled on a non-local target, without a
+      server binary, or with more than one rollout replica.
+  """
+  if bool(hp.config.get("enable_tool_cache", False)):
+    hp.config["tvcache_config"]["enable"] = True
+  # Mutate the live config so render_bash_exports sees a resolved binary.
+  tvcache = hp.config["tvcache_config"]
+  if not tvcache["enable"]:
+    return
+  # Lazy import: config resolution must not require the tvcache extra.
+  from tunix.rl.agentic.tools import tvcache as tvcache_lib  # pylint: disable=g-import-not-at-top
+
+  env_cls = _tool_cache_env_class(hp)
+  if env_cls is not None and not tvcache_lib.accepts_tool_cache(env_cls):
+    logger.warning(
+        "enable_tool_cache has no effect on %s: this environment does not"
+        " make tool calls. Training continues without the cache.",
+        env_cls.__name__,
+    )
+    tvcache["enable"] = False
+    return
+  cluster = hp.config_mapping("cluster_config")
+  if cluster["target"] != "local":
+    raise ValueError(
+        "tvcache_config.enable=true is only supported for"
+        " cluster_config.target=local; k8s support is a follow-up."
+    )
+  server_binary = tvcache["server_binary"]
+  if not isinstance(server_binary, str) or not server_binary.strip():
+    try:
+      tvcache["server_binary"] = tvcache_lib.resolve_server_binary()
+    except FileNotFoundError as exc:
+      raise ValueError(str(exc)) from exc
+  replicas = cluster["rollout_replicas"]
+  if replicas != 1:
+    raise ValueError(
+        "tvcache_config.enable=true requires cluster_config.rollout_replicas=1"
+        f" (got {replicas}); one SandboxManager drain loop runs in the"
+        " rollout process."
+    )
+  port = tvcache["port"]
+  if isinstance(port, bool) or not isinstance(port, int) or port <= 0:
+    raise ValueError(
+        f"tvcache_config.port must be a positive int, got {port!r}."
+    )
+  policy = tvcache["eviction_policy"]
+  if policy not in ("ttl_and_watermark", "none"):
+    raise ValueError(
+        "tvcache_config.eviction_policy must be 'ttl_and_watermark' or 'none',"
+        f" got {policy!r}."
+    )
+  snapshot = tvcache["snapshot"]
+  if not isinstance(snapshot, bool):
+    raise ValueError(
+        f"tvcache_config.snapshot must be a bool, got {snapshot!r}."
+    )
+
+
 def _validate_trajectory_logging(hp: cli_config.HyperParameters) -> None:
   """Checks `dist_training_config.trajectory_logging`.
 
@@ -881,6 +982,7 @@ def _validate_dist_invariants(hp: cli_config.HyperParameters) -> None:
   _validate_k8s_worker_jobsets(hp)
   _validate_rollout_replicas(hp)
   _validate_role_env(hp)
+  _validate_tvcache_config(hp)
   _validate_trajectory_logging(hp)
   _validate_rollout_logps_settings(hp)
   _validate_fault_tolerance(hp)
@@ -1600,6 +1702,7 @@ def render_bash_exports(hp: DistHyperParameters) -> str:
   actor = hp.config_mapping("actor_model_config")
   rollout_model = hp.config_mapping("rollout_model_config")
   ws = hp.config_mapping("weight_sync_config")
+  tvcache = hp.config_mapping("tvcache_config")
   sandbox_k8s = (
       hp.config["kubernetes_config"]
       if isinstance(hp.config["kubernetes_config"], Mapping)
@@ -1733,6 +1836,13 @@ def render_bash_exports(hp: DistHyperParameters) -> str:
           if "node_selector_val" in sandbox_k8s
           else ""
       ),
+      "TVCACHE_ENABLE": tvcache["enable"],
+      "TVCACHE_BINARY": tvcache["server_binary"],
+      "TVCACHE_HOST": tvcache["host"],
+      "TVCACHE_PORT": tvcache["port"],
+      "TVCACHE_EVICTION_POLICY": tvcache["eviction_policy"],
+      "TVCACHE_HIGH_WATERMARK_MB": tvcache["high_watermark_mb"],
+      "TVCACHE_LOW_WATERMARK_MB": tvcache["low_watermark_mb"],
   }
 
   lines = [f"export {k}={_bash_quote(v)}" for k, v in exports.items()]

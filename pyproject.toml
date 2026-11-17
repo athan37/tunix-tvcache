@@ -97,6 +97,10 @@ test = [
 cli = [
   "tensorflow",
 ]
+tvcache = [
+  # Stateful tool-value cache client for ToolEnvironment (tvcache-rust server).
+  "tvclient @ git+https://github.com/abhivijay96/tvclient.git",
+]
 otel = [
   # OpenTelemetry metrics export for dist_rl.
   "opentelemetry-api>=1.25.0",
@@ -136,6 +140,9 @@ build-dir = "build/{wheel_tag}"
 wheel.packages = ["tunix"]
 wheel.py-api = "cp312"
 editable.mode = "inplace"
+
+[tool.scikit-build.sdist]
+include = ["tunix/rl/agentic/tools/_tvcache_bin/*"]
 
 [tool.pyink]
 line-length = 80

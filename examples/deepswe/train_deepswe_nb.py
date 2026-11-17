@@ -151,6 +151,14 @@ parser.add_argument(
     action="store_true",
     help="Whether to use Kubernetes Agent Sandbox runtime instead of local Docker socket.",
 )
+parser.add_argument(
+    "--enable_tool_cache",
+    action="store_true",
+    help=(
+        "Reuse repeated tool results. Tunix starts a local tvcache server"
+        " when one is not already listening."
+    ),
+)
 
 parser.add_argument(
     "--overlong_filter",
@@ -1049,19 +1057,27 @@ config_kwargs = {
 
 grpo_config = agentic_grpo_learner.GRPOConfig(**config_kwargs)
 
+env_kwargs = {
+    "max_steps": MAX_TURNS,
+    "step_timeout": STEP_TIMEOUT_SECS,
+    "reward_timeout": REWARD_TIMEOUT_SECS,
+    "use_agent_sandbox": USE_AGENT_SANDBOX,
+    "fleet": fleet,
+}
+if args.enable_tool_cache:
+  from tunix.rl.agentic.tools import tvcache as tvcache_lib
+
+  tvcache_lib.ensure_local_server()
+  tvcache_lib.configure_thread_pool(MAX_CONCURRENCY)
+  env_kwargs["tvcache"] = {}
+
 agentic_grpo_learner = agentic_grpo_learner.GRPOLearner(
     rl_engine,
     reward_fns=None,
     agent_class=swe_agent.SWEAgent,
     agent_kwargs={},
     env_class=swe_env.SWEEnv,
-    env_kwargs={
-        "max_steps": MAX_TURNS,
-        "step_timeout": STEP_TIMEOUT_SECS,
-        "reward_timeout": REWARD_TIMEOUT_SECS,
-        "use_agent_sandbox": USE_AGENT_SANDBOX,
-        "fleet": fleet,
-    },
+    env_kwargs=env_kwargs,
     algo_config=grpo_config,
     chat_parser=chat_parser,
 )

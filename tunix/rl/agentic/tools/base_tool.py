@@ -178,6 +178,22 @@ class BaseTool(abc.ABC, metaclass=immutable.ImmutableMeta):
         },
     }
 
+  def will_mutate_state(self, **kwargs) -> bool:
+    """Whether this call changes the environment state for TVCache.
+
+    TVCache keys tool results by the sequence of calls whose
+    ``will_mutate_state`` is True. Stateless tools (e.g. a calculator) should
+    return False. The default True is the safe answer when unsure.
+
+    Args:
+      **kwargs: The same arguments that will be passed to ``apply``.
+
+    Returns:
+      True if this call may change sandbox state; False otherwise.
+    """
+    del kwargs
+    return True
+
   def apply(self, **kwargs) -> ToolOutput:
     """Execute the tool synchronously with the provided arguments.
 
@@ -197,6 +213,24 @@ class BaseTool(abc.ABC, metaclass=immutable.ImmutableMeta):
     raise NotImplementedError(
         "Tool must implement either `apply()` or `apply_async()`"
     )
+
+  def apply_in_sandbox(self, sandbox: Any, **kwargs) -> ToolOutput:
+    """Execute the tool against a TVCache sandbox.
+
+    Stateful tools override this to read or write ``sandbox`` state.
+    Stateless tools keep the default, which ignores the sandbox and calls
+    ``apply``.
+
+    Args:
+      sandbox: Sandbox constructed as ``(task_name, env_id)`` with ``start``,
+        ``fork``, ``execute``, and ``stop``.
+      **kwargs: Tool-specific parameters as defined in the JSON schema.
+
+    Returns:
+      ToolOutput: Standardized result containing output, error, or metadata.
+    """
+    del sandbox
+    return self.apply(**kwargs)
 
   async def apply_async(self, **kwargs) -> ToolOutput:
     """Execute the tool asynchronously with the provided arguments.

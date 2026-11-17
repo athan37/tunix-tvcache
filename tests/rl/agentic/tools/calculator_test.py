@@ -68,6 +68,9 @@ class CalculatorToolTest(absltest.TestCase):
     self.assertIn("Unsupported operator", result.error)
     self.assertIsNone(result.output)
 
+  def test_will_mutate_state_is_false(self):
+    self.assertFalse(self.tool.will_mutate_state(a=1, b=2, op="+"))
+
 
 if __name__ == "__main__":
   absltest.main()

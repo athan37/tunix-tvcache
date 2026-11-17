@@ -25,3 +25,19 @@
 /docs/sg_execution_times.rst
 /docs/generated
 build/*
+
+# Local scikit-build / nanobind outputs left in the repo root
+/.cmake/
+/CMakeCache.txt
+/CMakeFiles/
+/CMakeInit.txt
+/build.ninja
+/cmake_install.cmake
+/.ninja_deps
+/.ninja_log
+/.skbuild-info.json
+/libnanobind-static-abi3.a
+/uv.lock
+
+# Local prebuilt tvcache servers. Kept on disk, not published with the repo.
+/tunix/rl/agentic/tools/_tvcache_bin/

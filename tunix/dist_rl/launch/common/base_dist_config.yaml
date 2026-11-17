@@ -251,6 +251,31 @@ env_class_path: "gsm8kenv"
 env_kwargs: {}
 kubernetes_config: {}
 
+############################### TVCache ###############################
+# One switch. When true, Tunix uses a tvcache binary already on the machine,
+# or one placed beside this package, and starts it if nothing is listening
+# on port 7878. Supported only for `cluster_config.target: local` with
+# `rollout_replicas: 1`. An environment that does not use tools (for example
+# GSM8K) logs a warning and continues with the cache off.
+enable_tool_cache: false
+
+# Advanced overrides. Prefer enable_tool_cache above. `local.sh` starts the
+# server from server_binary; the rollout node runs the SandboxManager drain
+# loop. Leave server_binary empty to use the lookup above.
+tvcache_config:
+  enable: false
+  server_binary: ""
+  host: "127.0.0.1"
+  port: 7878
+  eviction_policy: "ttl_and_watermark"
+  high_watermark_mb: 1024
+  low_watermark_mb: 768
+  sandbox_class: "tunix.rl.agentic.tools.tvcache.InMemoryToolSandbox"
+  task_id_key: null
+  # false = value-only (hits skip execution; no docker commit forks).
+  # true = adaptive snapshots (requires a fork-capable sandbox, e.g. R2EGymSandbox on Docker).
+  snapshot: false
+
 agentic_ppo_config: {}
 agentic_grpo_config:
   num_generations: 8

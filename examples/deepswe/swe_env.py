@@ -104,6 +104,7 @@ class SWEEnv(BaseTaskEnv):
       max_steps: int = 1,
       use_agent_sandbox: bool = False,
       fleet: Any | None = None,
+      tvcache: Any | None = None,
   ):
     """Initialize the SWE environment.
 
@@ -121,6 +122,8 @@ class SWEEnv(BaseTaskEnv):
         use_agent_sandbox: If True, strictly forces SandboxFleet and
           AgentSandboxRuntime.
         fleet: Optional SandboxFleet instance to use.
+        tvcache: Optional TVCache config (``TvcacheConfig``, mapping, or None).
+          When set, tool steps and final grading go through tvclient.
     """
     self.entry = _unpack_entry(entry)
     self.step_timeout = step_timeout
@@ -134,6 +137,8 @@ class SWEEnv(BaseTaskEnv):
     self.scaffold = scaffold
     self.use_agent_sandbox = use_agent_sandbox
     self.fleet = fleet
+    self._tvcache_config = self._normalize_tvcache_config(tvcache)
+    self._tvcache_bridge = None
 
     assert scaffold in [
         "r2egym",
@@ -227,7 +232,73 @@ class SWEEnv(BaseTaskEnv):
     elif self.scaffold == "sweagent":
       self.env.add_commands(SWEAGENT_COMMAND_FILES)
 
+  @staticmethod
+  def _normalize_tvcache_config(tvcache: Any | None) -> Any | None:
+    """Converts a mapping into TvcacheConfig, or passes a config through."""
+    if tvcache is None:
+      return None
+    from tunix.rl.agentic.tools import tvcache as tvcache_lib  # pylint: disable=g-import-not-at-top
+
+    if isinstance(tvcache, tvcache_lib.TvcacheConfig):
+      return tvcache
+    if isinstance(tvcache, dict) or hasattr(tvcache, "keys"):
+      return tvcache_lib.TvcacheConfig(**dict(tvcache))
+    raise TypeError(
+        "tvcache must be a TvcacheConfig, mapping, or None; "
+        f"got {type(tvcache)!r}"
+    )
+
+  def _task_instruction_from_entry(self) -> str:
+    """Returns the problem text without needing a running container."""
+    for key in ("problem_statement", "instruction", "prompt"):
+      value = self.entry.get(key)
+      if value:
+        return str(value)
+    return str(self.entry.get("instance_id", ""))
+
+  def _reset_tvcache_episode(self) -> None:
+    """Creates a fresh TVCache bridge; the executor owns the container."""
+    from examples.deepswe import r2egym_tvcache  # pylint: disable=g-import-not-at-top
+    from tunix.rl.agentic.tools import tvcache as tvcache_lib  # pylint: disable=g-import-not-at-top
+
+    if self._tvcache_bridge is not None:
+      self._tvcache_bridge.close()
+      self._tvcache_bridge = None
+    if self._tvcache_config is None:
+      return
+
+    # Bound class closes over this episode so concurrent GRPO samples that
+    # share instance_id do not race. The dotted sandbox_class is unused here.
+    config = self._tvcache_config
+    task_id_key = config.task_id_key or "instance_id"
+    if task_id_key == "instance_id":
+      task_id = str(self.entry["instance_id"])
+    else:
+      task_id = tvcache_lib.task_id_for(self.entry, task_id_key)
+    self._tvcache_bridge = tvcache_lib.TvcacheBridge(
+        config,
+        task_id,
+        sandbox_cls=r2egym_tvcache.bind_sandbox_cls(self),
+    )
+
+  def _final_reward_via_tvcache(self) -> float:
+    assert self._tvcache_bridge is not None
+    return float(self._tvcache_bridge.test())
+
   def _initial_observation(self) -> Any:
+    self.total_steps = 0
+    if self._tvcache_config is not None:
+      # Executor owns container lifecycle; do not start one here.
+      if self.env is not None:
+        try:
+          self.env.close()
+        except Exception:  # pylint: disable=broad-exception-caught
+          logging.exception("[SWEEnv] Failed to close leftover env before TVCache")
+        self.env = None
+      self._reset_tvcache_episode()
+      self.final_reward_fn = self._final_reward_via_tvcache
+      return self._task_instruction_from_entry()
+
     if not self.env:
       if self.use_agent_sandbox:
         self._init_agent_sandbox_env()
@@ -237,7 +308,6 @@ class SWEEnv(BaseTaskEnv):
       self.env.reset()
 
     self.final_reward_fn = self.env.compute_reward  # pyrefly: ignore[missing-attribute]
-    self.total_steps = 0
 
     # Polls docker runtime to get task instruction.
     return self.env.get_task_instruction()  # pyrefly: ignore[missing-attribute]
@@ -259,6 +329,28 @@ class SWEEnv(BaseTaskEnv):
           info={"max_steps": self.max_steps},
       )
 
+    if self._tvcache_bridge is not None:
+      from examples.deepswe import r2egym_tvcache  # pylint: disable=g-import-not-at-top
+
+      raw = self._tvcache_bridge.call(
+          r2egym_tvcache.make_r2egym_tool_call(action_obj)
+      )
+      self.total_steps += 1
+      if raw.startswith("Failed to execute:"):
+        return EnvStepResult(
+            observation=raw,
+            reward=0,
+            done=False,
+            info={"max_steps": self.max_steps, "error": raw},
+        )
+      payload = json.loads(raw)
+      return EnvStepResult(
+          observation=str(payload.get("obs", "")),
+          reward=payload.get("reward", 0),
+          done=bool(payload.get("done", False)),
+          info=payload.get("info") or {"max_steps": self.max_steps},
+      )
+
     # RepoEnv always returns 0 reward, must be evaluated by DockerRuntime.
     if not self.env:
       raise ValueError("Environment not initialized")
@@ -272,8 +364,14 @@ class SWEEnv(BaseTaskEnv):
 
   def close(self) -> None:
     """Close the environment and clean up resources."""
-    if self.env is not None:
-      self.env.close()
+    if self._tvcache_bridge is not None:
+      self._tvcache_bridge.close()
+      self._tvcache_bridge = None
+
+    env = self.env
+    if env is not None:
+      env.close()
+      self.env = None
 
     fleet = self.fleet or getattr(sandbox_utils, "_GLOBAL_FLEET", None)
     if (
@@ -289,10 +387,10 @@ class SWEEnv(BaseTaskEnv):
     if (
         self.delete_image
         and not self.use_agent_sandbox
-        and self.env
-        and hasattr(self.env, "runtime")
+        and env is not None
+        and hasattr(env, "runtime")
     ):
-      docker_image = getattr(self.env.runtime, "docker_image", None)
+      docker_image = getattr(env.runtime, "docker_image", None)
       if docker_image:
         os.system(f"docker rmi {docker_image}")
 

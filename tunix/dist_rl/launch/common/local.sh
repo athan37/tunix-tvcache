@@ -34,6 +34,7 @@ TRAINER_LOG="${LOG_ROOT}/trainer.log"
 ROLLOUT_LOG="${LOG_ROOT}/rollout.log"
 INFERENCE_LOG="${LOG_ROOT}/inference.log"
 ORCHESTRATOR_LOG="${LOG_ROOT}/orchestrator.log"
+TVCACHE_LOG="${LOG_ROOT}/tvcache.log"
 
 SHUTDOWN_SIGNAL_COUNT=0
 DRAIN_START_SECONDS=0
@@ -395,7 +396,7 @@ cleanup() {
     trainer_pids+=("$TRAINER_PID")
     all_pids+=("$TRAINER_PID")
   fi
-  for pid in "${ROLLOUT_PID:-}" "${INFERENCE_PID:-}"; do
+  for pid in "${ROLLOUT_PID:-}" "${INFERENCE_PID:-}" "${TVCACHE_PID:-}"; do
     if [[ -n "$pid" ]]; then
       worker_pids+=("$pid")
       all_pids+=("$pid")
@@ -466,6 +467,7 @@ mkdir -p "$LOG_ROOT" "$ARTIFACT_ROOT"
 : > "$ROLLOUT_LOG"
 : > "$INFERENCE_LOG"
 : > "$ORCHESTRATOR_LOG"
+: > "$TVCACHE_LOG"
 
 configure_local_worker_env() {
   local role_framework="$1"
@@ -510,6 +512,38 @@ configure_local_worker_env() {
     export ALLOW_MULTIPLE_LIBTPU_LOAD=1
   fi
 }
+
+if is_true "${TVCACHE_ENABLE:-false}"; then
+  if [[ -z "${TVCACHE_BINARY}" ]]; then
+    echo "Error: TVCACHE_ENABLE=true requires TVCACHE_BINARY (tvcache_config.server_binary)." >&2
+    exit 1
+  fi
+  if [[ ! -x "${TVCACHE_BINARY}" ]]; then
+    echo "Error: TVCACHE_BINARY is not an executable file: ${TVCACHE_BINARY}" >&2
+    exit 1
+  fi
+  echo "Launching TVCache server on ${TVCACHE_HOST}:${TVCACHE_PORT}..."
+  # Bind address is fixed in tvcache-rust (0.0.0.0:7878). Host is exported for
+  # the rollout node; the binary listens on all interfaces.
+  if [[ "${TVCACHE_PORT}" != "7878" ]]; then
+    echo "Error: tvcache-rust currently binds to port 7878; got TVCACHE_PORT=${TVCACHE_PORT}." >&2
+    echo "Set tvcache_config.port=7878 (or extend the binary to accept --port)." >&2
+    exit 1
+  fi
+  tvcache_cmd=(
+    "${TVCACHE_BINARY}"
+    --eviction-policy="${TVCACHE_EVICTION_POLICY}"
+    --high-watermark-mb="${TVCACHE_HIGH_WATERMARK_MB}"
+    --low-watermark-mb="${TVCACHE_LOW_WATERMARK_MB}"
+  )
+  (
+    print_command "TVCache command" "${tvcache_cmd[@]}"
+    exec "${tvcache_cmd[@]}" > "$TVCACHE_LOG" 2>&1
+  ) &
+  TVCACHE_PID=$!
+  echo "TVCache pid=$TVCACHE_PID log=$TVCACHE_LOG"
+  wait_for_port "tvcache" "$TVCACHE_PORT" "$TVCACHE_PID" "$TVCACHE_LOG"
+fi
 
 echo "Launching trainer node (${TRAINER_FRAMEWORK}:${TRAINER_ACCELERATOR}) on devices ${LOCAL_TRAINER_DEVICES}..."
 (
